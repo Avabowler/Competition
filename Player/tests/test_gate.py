@@ -16,11 +16,11 @@ FIXTURE = ROOT / "tests" / "fixtures" / "request.json"
 def make_brain_turn(round_no: int):
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     payload["roundNo"] = round_no
-    # 样例基地 (10,24)：footprint (10,23)-(11,24)，门口 = (13,21)
+    # 样例基地 (10,24)：footprint (10,23)-(11,24)，门口 = (8,22)（西侧背面）
     # 把工人 10010 变成石头工且放到门口邻格、带石头
     for role in payload["teamOur"]["roles"]:
         if role["id"] == 10010:
-            role["pos"] = {"x": 12, "y": 21}
+            role["pos"] = {"x": 9, "y": 21}
             role["backpack"] = ["stone", "stone"]
         if role["id"] in (10011, 10012):
             role["pos"] = {"x": 12, "y": 22}      # 全员在基地旁（人齐才关门）
@@ -37,7 +37,7 @@ def test_gate_closed_at_dusk():
     command = decision.commands.get(10010)
     assert command is not None and command["action"] == "build"
     assert command["name"] == "wall"
-    assert command["targetPos"][0] == {"x": 13, "y": 21}
+    assert command["targetPos"][0] == {"x": 8, "y": 22}
 
 
 def test_gate_opened_at_morning():
@@ -47,20 +47,20 @@ def test_gate_opened_at_morning():
     payload["roundNo"] = 3
     for role in payload["teamOur"]["roles"]:
         if role["id"] == 10010:
-            role["pos"] = {"x": 12, "y": 21}
+            role["pos"] = {"x": 9, "y": 21}
             role["backpack"] = ["stone"]
     payload["teamOur"]["roles"].append({
-        "id": 40050, "pos": {"x": 13, "y": 21}, "roleType": "wall",
+        "id": 40050, "pos": {"x": 8, "y": 22}, "roleType": "wall",
         "health": 1000, "attackPower": 0, "attackRange": 0, "level": 1,
         "backPackCapability": 0, "backpack": [],
     })
     turn = Turn.load(payload)
-    brain.memory.gate.pos = (13, 21)
+    brain.memory.gate.pos = (8, 22)
     decision = Decision()
     brain._gate_morning(turn, decision, set(), set())
     command = decision.commands.get(10010)
     assert command is not None and command["action"] == "remove"
-    assert command["targetPos"][0] == {"x": 13, "y": 21}
+    assert command["targetPos"][0] == {"x": 8, "y": 22}
 
 
 def test_gate_not_closed_when_someone_outside():
@@ -89,4 +89,4 @@ def test_gate_disabled_after_build_failures():
 def test_entrance_pos_matches_wall_plan():
     brain, turn = make_brain_turn(10)
     door = entrance_pos(turn)
-    assert door is not None and (door.x, door.y) == (13, 21)
+    assert door is not None and (door.x, door.y) == (8, 22)

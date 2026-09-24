@@ -298,8 +298,9 @@ class MockJudger:
 
     def _spawn_robots(self, day: int) -> None:
         world = self.world
-        for target_team, corner in (("challenger", (0, 31)), ("defender", (40, 0)),
-                                    ("challenger", (0, 0)), ("defender", (40, 31))):
+        # 真实情报：机器人从远离基地的一侧压过来（左基地从右被攻，右基地从左）
+        for target_team, corner in (("challenger", (40, 31)), ("defender", (0, 0)),
+                                    ("challenger", (40, 0)), ("defender", (0, 31))):
             side = next(s for s in world.sides if s.team == target_team)
             if side.station.health <= 0:
                 continue

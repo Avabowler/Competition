@@ -20,15 +20,16 @@ def footprint_distance(pos: Pos, footprint: tuple[Pos, ...]) -> int:
 
 
 def attack_side(turn: Turn) -> str:
-    """机器人来袭方向："west"（基地在地图左半）/"east"（右半）。
+    """机器人来袭方向："east"（基地在地图左半）/"west"（右半）。
 
-    实战情报：红方（基地方位偏左）机器人从左来，蓝方（偏右）从右来；
+    实战情报（真实环境校准）：机器人从远离基地的一侧压过来——
+    左半区基地的机器人从右（东）来，右半区基地的从左（西）来。
     半场换边后基地坐标互换，此推断自动适配。
     """
     station = turn.station()
     if station is None:
-        return "west"
-    return "west" if station.pos.x * 2 < turn.width else "east"
+        return "east"
+    return "east" if station.pos.x * 2 < turn.width else "west"
 
 
 def entrance_side(turn: Turn) -> str:
@@ -185,8 +186,8 @@ def wall_plan(turn: Turn, memory: GameMemory | None = None) -> list[Pos]:
 def entrance_pos(turn: Turn) -> Pos | None:
     """围墙圈的门口位置：来袭方向背面的角格。
 
-    基地在左半区（机器人从左来）-> 门开东侧 (xmax+2, ymin-2)；
-    基地在右半区（机器人从右来）-> 门开西侧 (xmin-2, ymin-1)。
+    基地在左半区（机器人从东来）-> 门开西侧 (xmin-2, ymin-1)；
+    基地在右半区（机器人从西来）-> 门开东侧 (xmax+2, ymin-2)。
     """
     station = turn.station()
     if station is None:
