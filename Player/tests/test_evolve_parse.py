@@ -115,3 +115,63 @@ def test_sop_signature_only_hint_mode():
     module.observe(turn)
     assert module._pending_answer is None       # 不直接交过期答案
     assert state.sop_hint_used                  # 转为提示模式
+
+
+def test_history_cleared_between_tasks():
+    """上一个任务的命令历史不得滚进下一个任务的 prompt。"""
+    text = "新任务：计算 1+1 的值。"
+    memory = GameMemory()
+    state = memory.evolve
+    state.phase = "walking"
+    state.task_point = (14, 14)
+    state.cmd_history = [("ls", "[exitCode:0]\n上一任务的旧输出")]
+    state.llm_history = [("", "旧响应")]
+    module = EvolveModule(memory)
+    turn = Turn.load({
+        "roundNo": 80, "mapInfo": {"width": 41, "height": 32, "zones": []},
+        "teamOur": {"roles": [
+            {"id": 10011, "pos": {"x": 14, "y": 13}, "roleType": "pioneer",
+             "health": 200, "backPackCapability": 40, "backpack": []},
+        ]},
+        "phaseTask": text,
+    })
+    module.observe(turn)
+    assert state.phase == "solving"
+    assert state.cmd_history == []
+    assert state.llm_history == []
+
+
+def test_prompt_keeps_tail_of_output():
+    """命令输出超长时 prompt 应保留末尾（报错/结果在尾部），而不是头部。"""
+    memory = GameMemory()
+    state = memory.evolve
+    state.phase = "solving"
+    state.task_point = (14, 14)
+    state.accepted_round = 50
+    state.timeout_rounds = 60
+    state.cmd_history = [("cat big.txt", "[exitCode:0]\n" + "x" * 500 + "TAIL_MARKER")]
+    module = EvolveModule(memory)
+    turn = Turn.load({
+        "roundNo": 52, "mapInfo": {"width": 41, "height": 32, "zones": []},
+        "teamOur": {"roles": [
+            {"id": 10011, "pos": {"x": 14, "y": 13}, "roleType": "pioneer",
+             "health": 200, "backPackCapability": 40, "backpack": []},
+        ]},
+        "phaseTask": "任务",
+    })
+    prompt = module.wants_prompt(turn)
+    assert prompt is not None
+    assert "TAIL_MARKER" in prompt           # 末尾保留
+    assert prompt.count("x" * 500) == 0      # 头部被截断
+
+
+def test_answer_line_too_long_ignored():
+    long_prose = "这个问题比较复杂，需要进一步分析沙盒中的数据文件才能得出最终结论"
+    assert extract_llm_action(f"答案: {long_prose}") is None
+    assert extract_llm_action("最终答案: 42") == ("answer", "42")
+
+
+def test_json_key_aliases():
+    assert extract_llm_action('{"command": "ls -la"}') == ("cmd", "ls -la")
+    assert extract_llm_action('{"answer": "579"}') == ("answer", "579")
+    assert extract_llm_action('{"final_answer": "12"}') == ("answer", "12")

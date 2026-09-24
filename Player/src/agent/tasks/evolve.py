@@ -94,8 +94,11 @@ def extract_llm_action(text: str) -> tuple[str, str] | None:
         return None
     parsed = _extract_json(text)
     if parsed:
-        cmd = parsed.get("executeCmd")
-        answer = parsed.get("taskAnswer")
+        # 键名别名：判题器 LLM 未必按我们的示例用 executeCmd/taskAnswer
+        cmd = (parsed.get("executeCmd") or parsed.get("command")
+               or parsed.get("cmd"))
+        answer = (parsed.get("taskAnswer") or parsed.get("answer")
+                  or parsed.get("final_answer"))
         if isinstance(cmd, str) and cmd.strip():
             return ("cmd", cmd.strip())
         if isinstance(answer, str) and answer.strip():
@@ -117,9 +120,13 @@ def extract_llm_action(text: str) -> tuple[str, str] | None:
         if any(s.startswith(hint) for hint in COMMAND_HINTS):
             return ("cmd", s)
 
-    marked = re.search(r"(?:最终答案|答案|answer)\s*[:：]\s*(\S.*)", text, re.I)
+    marked = re.search(r"(?:最终答案|答案|answer)\s*[:：]\s*(\S[^\n]*)", text, re.I)
     if marked:
-        return ("answer", marked.group(1).strip())
+        value = marked.group(1).strip()
+        # 太长或含叙述性标点说明是分析过程（如"初步答案是42，让我再验证"），
+        # 不是答案本身
+        if len(value) <= 24 and not re.search(r"[，。；！？、“”‘’]", value):
+            return ("answer", value)
     return None
 
 
@@ -186,6 +193,13 @@ class EvolveModule:
         state.parse_failures = 0
         state.corrected_prompt_sent = False
         state.sop_hint_used = False
+        state.sop_hint_injected = False
+        # 每个任务独立的干净上下文：清掉上一个任务遗留的命令/响应历史，
+        # 否则上一任务的输出会滚进本任务 prompt，LLM 会被无关上下文带偏
+        state.cmd_history = []
+        state.llm_history = []
+        state.explore_index = 0
+        state.llm_retry_round = 0
         for tp in turn.player_tasks:
             if state.task_point and tp.pos == Pos(*state.task_point):
                 state.task_type = tp.task_type
@@ -244,6 +258,11 @@ class EvolveModule:
         state.best_answer = ""
         state.accept_retries = 0
         state.parse_failures = 0
+        state.cmd_history = []
+        state.llm_history = []
+        state.explore_index = 0
+        state.llm_retry_round = 0
+        state.corrected_prompt_sent = False
 
     # ---------------------------------------------------------------- 规划
 
@@ -425,7 +444,10 @@ class EvolveModule:
         state = self.memory.evolve
         pairs: list[str] = []
         for cmd, result in state.cmd_history[-6:]:
-            snippet = result.replace("\n", " | ")[:300]
+            snippet = result.replace("\n", " | ")
+            if len(snippet) > 400:
+                # 只保留末尾：报错信息/计算结果/文档关键段几乎都在输出的后半段
+                snippet = "…" + snippet[-400:]
             pairs.append(f"$ {cmd[:120]}\n{snippet}" if cmd else snippet)
         rejected = any(e.code == 2 for e in turn.errors)
 
