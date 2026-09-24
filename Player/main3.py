@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""参赛程序入口：python main.py <port>"""
+"""参赛程序入口（与 Demo 同款）：python main3.py <port>"""
 import logging
 import os
 import sys
@@ -22,7 +22,7 @@ def _setup_logging(root: Path) -> None:
 
 def main() -> None:
     if len(sys.argv) != 2:
-        raise SystemExit("Usage: python main.py <port>")
+        raise SystemExit("Usage: python main3.py <port>")
     port = int(sys.argv[1])
     root = Path(__file__).resolve().parent
     os.chdir(root)

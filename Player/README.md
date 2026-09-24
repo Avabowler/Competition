@@ -5,12 +5,14 @@
 ## 启动
 
 ```bash
-bash run.sh <port>     # 判题器标准启动方式
+bash run.sh <port>      # 判题器标准启动方式
+python main3.py <port>  # 等价直调（与 Demo 同款入口）
 ```
 
-## 架构
+## 架构（与 Demo/CoreGeek 同构：根目录 main3.py 入口 + src/agent 包）
 
 ```
+main3.py          # 入口：解析 port、日志落盘、启动 HTTP 服务
 src/agent/
 ├── server.py       # HTTP 层：3.5s 决策看门狗，异常兜底返回空指令
 ├── brain.py        # 总调度：昼夜编排、开拓者优先级、LLM prompt 槽仲裁
