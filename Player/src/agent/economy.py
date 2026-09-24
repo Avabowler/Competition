@@ -8,7 +8,7 @@
 """
 import logging
 
-from .build import towers_pending, walls_pending
+from .build import front_cells, towers_pending, walls_pending
 from .grid import next_step
 from .items import building_max_health
 from .memory import GameMemory
@@ -425,7 +425,10 @@ class Economy:
             candidates = [w for w in turn.walls() if w.level == wanted_level]
             if not candidates:
                 return None
-            return min(candidates, key=lambda w: w.health).pos
+            front = front_cells(turn)
+            # 正面墙优先（吃伤害最多），同级里再挑血量最低的
+            candidates.sort(key=lambda w: (w.pos not in front, w.health))
+            return candidates[0].pos
         return None
 
 

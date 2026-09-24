@@ -11,6 +11,7 @@
 """
 import logging
 
+from .build import front_cells
 from .grid import next_step
 from .memory import GameMemory
 from .protocol import (
@@ -194,9 +195,11 @@ class ItemService:
         for role in turn.workers():
             if role.unit_id in handled or "WallFixer" not in role.backpack:
                 continue
+            front = front_cells(turn)
             target = min(
                 damaged,
-                key=lambda w: (distance(role.pos, w.pos), w.pos.x, w.pos.y),
+                key=lambda w: (w.pos not in front,
+                               distance(role.pos, w.pos), w.pos.x, w.pos.y),
             )
             if distance(role.pos, target.pos) <= 1:
                 decision.commands[role.unit_id] = cmd_use("WallFixer", target.pos)
@@ -225,6 +228,8 @@ class ItemService:
         ]
         if not critical:
             return
+        front = front_cells(turn)
+        critical.sort(key=lambda w: (w.pos not in front, w.health, w.pos.x, w.pos.y))
         for role in turn.controllables():
             if role.unit_id in handled or "WallFixer" not in role.backpack:
                 continue

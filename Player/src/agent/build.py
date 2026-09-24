@@ -19,25 +19,54 @@ def footprint_distance(pos: Pos, footprint: tuple[Pos, ...]) -> int:
     return min(distance(pos, cell) for cell in footprint)
 
 
-def wall_ring(turn: Turn) -> frozenset[Pos]:
-    """围墙圈静态几何（不含门口、不含中立/出界格），供建造与选址共用。"""
+def attack_side(turn: Turn) -> str:
+    """机器人来袭方向："west"（基地在地图左半）/"east"（右半）。
+
+    实战情报：红方（基地方位偏左）机器人从左来，蓝方（偏右）从右来；
+    半场换边后基地坐标互换，此推断自动适配。
+    """
     station = turn.station()
     if station is None:
-        return frozenset()
+        return "west"
+    return "west" if station.pos.x * 2 < turn.width else "east"
+
+
+def entrance_side(turn: Turn) -> str:
+    """门口开在来袭方向的背面。"""
+    return "east" if attack_side(turn) == "west" else "west"
+
+
+def wall_rows(turn: Turn) -> dict[str, list[Pos]]:
+    """围墙圈四排格子（不含门口，门口由调用方排除）。"""
+    station = turn.station()
+    if station is None:
+        return {}
     footprint = station_footprint(station.pos)
     xs = [p.x for p in footprint]
     ys = [p.y for p in footprint]
     xmin, xmax = min(xs), max(xs)
     ymin, ymax = min(ys), max(ys)
-    entrance = Pos(xmax + 2, ymin - 2)
+    return {
+        "south": [Pos(x, ymin - 2) for x in range(xmin - 2, xmax + 3)],
+        "north": [Pos(x, ymax + 2) for x in range(xmin - 2, xmax + 3)],
+        "west": [Pos(xmin - 2, y) for y in range(ymin - 1, ymax + 2)],
+        "east": [Pos(xmax + 2, y) for y in range(ymin - 1, ymax + 2)],
+    }
+
+
+def front_cells(turn: Turn) -> frozenset[Pos]:
+    """来袭正面的墙排（修复/升级优先级最高）。"""
+    rows = wall_rows(turn)
+    return frozenset(rows.get(attack_side(turn), ()))
+
+
+def wall_ring(turn: Turn) -> frozenset[Pos]:
+    """围墙圈静态几何（不含门口、不含中立/出界格），供建造与选址共用。"""
+    door = entrance_pos(turn)
     cells: set[Pos] = set()
-    for x in range(xmin - 2, xmax + 3):
-        for y in range(ymin - 2, ymax + 3):
-            pos = Pos(x, y)
-            ring = footprint_distance(pos, footprint)
-            if ring != 2 or pos == entrance or not turn.on_map(pos):
-                continue
-            if pos in turn.zones:
+    for row in wall_rows(turn).values():
+        for pos in row:
+            if pos == door or not turn.on_map(pos) or pos in turn.zones:
                 continue
             cells.add(pos)
     return frozenset(cells)
@@ -71,11 +100,13 @@ def tower_sites(turn: Turn, memory: GameMemory | None = None) -> list[Pos]:
     if len(candidates) < 3:
         return candidates
 
-    door = Pos(max(p.x for p in footprint) + 2, min(p.y for p in footprint) - 2)
-    door_adjacent = {
-        n for n in door.neighbours()
-        if footprint_distance(n, footprint) == 1 and n in candidates
-    }
+    door = entrance_pos(turn)
+    door_adjacent = set()
+    if door is not None:
+        door_adjacent = {
+            n for n in door.neighbours()
+            if footprint_distance(n, footprint) == 1 and n in candidates
+        }
 
     def evaluate(combo: tuple[Pos, ...]) -> tuple[int, int, int] | None:
         blocked = set(footprint) | set(combo) | set(ring2) | set(turn.zones)
@@ -121,27 +152,23 @@ def tower_sites(turn: Turn, memory: GameMemory | None = None) -> list[Pos]:
     return list(best)
 
 def wall_plan(turn: Turn, memory: GameMemory | None = None) -> list[Pos]:
-    """基地外圈两格的围墙防线，顺时针列出，留一个门口。"""
+    """围墙防线：**来袭正面优先**建造，门口开在背面。
+
+    来袭方向由基地在地图的左右半区推断（左半区基地 -> 机器人从左来）。
+    建造顺序：正面排 -> 南 -> 北 -> 背面排（门口在背面排上，最后合拢）。
+    """
     station = turn.station()
     if station is None:
         return []
-    footprint = station_footprint(station.pos)
-    xs = [p.x for p in footprint]
-    ys = [p.y for p in footprint]
-    xmin, xmax = min(xs), max(xs)
-    ymin, ymax = min(ys), max(ys)
-    order = [
-        *(Pos(x, ymin - 2) for x in range(xmin - 2, xmax + 3)),        # 南
-        *(Pos(xmax + 2, y) for y in range(ymin - 1, ymax + 2)),        # 东
-        *(Pos(x, ymax + 2) for x in range(xmin - 2, xmax + 3)),        # 北
-        *(Pos(xmin - 2, y) for y in range(ymin - 1, ymax + 2)),        # 西
-    ]
-    # 东南角留门（机器人来袭方向未知，固定门口便于角色进出与防守集中）
-    entrance = Pos(xmax + 2, ymin - 2)
+    rows = wall_rows(turn)
+    front = attack_side(turn)
+    back = entrance_side(turn)
+    order = [*rows[front], *rows["south"], *rows["north"], *rows[back]]
+    door = entrance_pos(turn)
     occupied = turn.occupied_cells()
     planned: list[Pos] = []
     for pos in order:
-        if pos == entrance:
+        if door is not None and pos == door:
             continue
         if not turn.on_map(pos):
             continue
@@ -156,14 +183,20 @@ def wall_plan(turn: Turn, memory: GameMemory | None = None) -> list[Pos]:
 
 
 def entrance_pos(turn: Turn) -> Pos | None:
-    """围墙圈的门口位置（与 wall_plan 排除的是同一格），关门战术目标点。"""
+    """围墙圈的门口位置：来袭方向背面的角格。
+
+    基地在左半区（机器人从左来）-> 门开东侧 (xmax+2, ymin-2)；
+    基地在右半区（机器人从右来）-> 门开西侧 (xmin-2, ymin-1)。
+    """
     station = turn.station()
     if station is None:
         return None
     footprint = station_footprint(station.pos)
     xs = [p.x for p in footprint]
     ys = [p.y for p in footprint]
-    return Pos(max(xs) + 2, min(ys) - 2)
+    if entrance_side(turn) == "east":
+        return Pos(max(xs) + 2, min(ys) - 2)
+    return Pos(min(xs) - 2, min(ys) - 1)
 
 
 def walls_pending(turn: Turn, memory: GameMemory) -> list[Pos]:
