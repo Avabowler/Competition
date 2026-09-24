@@ -5,7 +5,11 @@
   试建造失败的格子记入 memory.build_failures，后续跳过。
 - 任务书规定子弹/电磁能量只被机器人吸收，围墙不挡弹道，
   因此"围墙圈+圈内炮台"可行：炮台可越过围墙打击啃墙的机器人。
+- 聚控布局：控制位 S 也是 ring1 空格（不建东西），三座塔建在 S 周围的
+  ring1 相邻格上——开拓者站 S 即与三塔相邻，一人可同时操控三座炮台。
 """
+from itertools import combinations
+
 from .memory import GameMemory
 from .protocol import (
     Pos,
@@ -73,15 +77,8 @@ def wall_ring(turn: Turn) -> frozenset[Pos]:
     return frozenset(cells)
 
 
-def tower_sites(turn: Turn, memory: GameMemory | None = None) -> list[Pos]:
-    """基地周围一格的炮台位（固定锚点）。
-
-    选址准则（连通性优先）：三座塔的"可站位格"必须从门口经内部走廊全部可达，
-    否则会出现第三座炮台永远无人可控的结构性死位。在所有 3-组合里选
-    (连通可行, 可站位格最多, 打散度大) 的最优解；几何静态，结果稳定。
-    """
-    from itertools import combinations
-
+def _ring1_candidates(turn: Turn, memory: GameMemory | None) -> list[Pos]:
+    """基地旁一圈的可选建造格（排除中立区/围墙圈/失败格），按坐标排序。"""
     station = turn.station()
     if station is None:
         return []
@@ -93,11 +90,93 @@ def tower_sites(turn: Turn, memory: GameMemory | None = None) -> list[Pos]:
         and footprint_distance(n, footprint) == 1
         and n not in turn.zones
         and n not in ring2
+        and (memory is None or (n.x, n.y) not in memory.build_failures)
     }, key=lambda p: (p.x, p.y))
-    if memory is not None:
-        candidates = [
-            p for p in candidates if (p.x, p.y) not in memory.build_failures
+    return candidates
+
+
+def _seat_corridor_ok(seat: Pos, towers: set[Pos], candidates: list[Pos],
+                      door: Pos | None) -> bool:
+    """控制位是否经 ring1 空格走廊与门口连通（圈内的角色要能走到座位）。"""
+    free = {c for c in candidates if c not in towers}
+    if door is None:
+        return True
+    starts = {c for c in free if distance(c, door) <= 1}
+    if not starts:
+        return False
+    visited: set[Pos] = set(starts)
+    frontier = list(starts)
+    while frontier:
+        cur = frontier.pop()
+        for n in cur.neighbours():
+            if n in free and n not in visited:
+                visited.add(n)
+                frontier.append(n)
+    return seat in visited
+
+
+def cluster_plan(turn: Turn,
+                 memory: GameMemory | None) -> tuple[Pos, list[Pos]] | None:
+    """三塔聚控布局：返回 (控制位 S, 三塔坐标)。
+
+    约束：S 与三塔均为 ring1 候选、三塔与 S 切比雪夫距离 <=1、
+    S 经 ring1 空格从门口可达。评分：延续旧座位（稳定）> 座位贴近门口
+    （背侧，远离来袭方向保开拓者）> 确定性。
+    """
+    candidates = _ring1_candidates(turn, memory)
+    if len(candidates) < 4:
+        return None
+    occupied = turn.occupied_cells()
+    door = entrance_pos(turn)
+    prev_seat = (
+        Pos(*memory.tower_seat)
+        if memory is not None and memory.tower_seat else None
+    )
+    best: tuple[Pos, list[Pos]] | None = None
+    best_score: tuple[int, int] | None = None
+    for seat in candidates:
+        if seat in occupied:
+            continue          # 控制位必须可站立（不能压在已有建筑上）
+        adjacent = [
+            c for c in candidates if c != seat and distance(c, seat) <= 1
         ]
+        if len(adjacent) < 3:
+            continue
+        for towers in combinations(adjacent, 3):
+            if not _seat_corridor_ok(seat, set(towers), candidates, door):
+                continue
+            stable = 1 if prev_seat is not None and seat == prev_seat else 0
+            door_affinity = -distance(seat, door) if door is not None else 0
+            # 座位贴近门口（背侧）：远离机器人来袭方向保开拓者，
+            # 射程不足的加特林损失由火箭(10)/电磁炮(6+)的全局射程补足
+            score = (stable, door_affinity)
+            if best_score is None or score > best_score:
+                best_score = score
+                best = (seat, list(towers))
+    return best
+
+
+def tower_sites(turn: Turn, memory: GameMemory | None = None) -> list[Pos]:
+    """炮台选址：聚控优先（顺带持久化控制位），无解回退分散布局。"""
+    cluster = cluster_plan(turn, memory)
+    if cluster is not None:
+        seat, sites = cluster
+        if memory is not None:
+            memory.tower_seat = (seat.x, seat.y)
+        return sorted(sites, key=lambda p: (p.x, p.y))
+    if memory is not None:
+        memory.tower_seat = None
+    return _scattered_sites(turn, memory)
+
+
+def _scattered_sites(turn: Turn, memory: GameMemory | None) -> list[Pos]:
+    """（回退）分散选址：三座塔的可站位格须从门口经内部走廊全部可达。"""
+    station = turn.station()
+    if station is None:
+        return []
+    footprint = station_footprint(station.pos)
+    ring2 = wall_ring(turn)
+    candidates = _ring1_candidates(turn, memory)
     if len(candidates) < 3:
         return candidates
 

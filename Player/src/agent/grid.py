@@ -69,6 +69,45 @@ def next_step(turn: Turn, moving: Unit, goal: Pos | set[Pos] | frozenset[Pos]) -
     return None
 
 
+def approach_step(turn: Turn, moving: Unit, goal: Pos) -> Pos | None:
+    """next_step 的 best-effort 版本：目标完全不可达时，返回通往
+    "可达区域中离 goal 最近格" 的第一步（贴墙逼近；堵塞一解除即接上）。"""
+    step = next_step(turn, moving, goal)
+    if step is not None or moving.pos == goal:
+        return step
+
+    blocked = turn.blocked(moving)
+    order = count()
+    frontier: list[tuple[int, int, int, Pos]] = [(0, 0, next(order), moving.pos)]
+    best: dict[Pos, tuple[int, int]] = {moving.pos: (0, 0)}
+    came_from: dict[Pos, Pos] = {}
+    seen: set[Pos] = set()
+    best_cell: tuple[int, int, Pos] = (distance(moving.pos, goal), 0, moving.pos)
+
+    while frontier:
+        _, cost, _, current = heappop(frontier)
+        if current in seen:
+            continue
+        seen.add(current)
+        heuristic = distance(current, goal)
+        if (heuristic, cost) < best_cell[:2]:
+            best_cell = (heuristic, cost, current)
+        for dx, dy in _STEPS:
+            step = Pos(current.x + dx, current.y + dy)
+            if step in blocked or not turn.on_map(step) or step in seen:
+                continue
+            new_cost = cost + 1
+            if (new_cost, new_cost) >= best.get(step, (new_cost + 1, new_cost)):
+                continue
+            best[step] = (new_cost, new_cost)
+            came_from[step] = current
+            heappush(frontier, (new_cost + heuristic, new_cost, next(order), step))
+
+    if best_cell[2] == moving.pos:
+        return None
+    return _first_step(came_from, moving.pos, best_cell[2])
+
+
 def adjacent_cells(turn: Turn, center: Pos, moving: Unit | None = None) -> list[Pos]:
     """center 周围一圈中可站立的格子（不越界；默认排除障碍）。"""
     blocked = turn.blocked(moving)

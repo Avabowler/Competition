@@ -64,9 +64,9 @@ def test_gate_opened_at_morning():
     assert command["targetPos"][0] == {"x": 8, "y": 22}
 
 
-def test_gate_not_closed_when_someone_outside():
-    brain, turn = make_brain_turn(69)
-    # 开拓者远离基地 -> 不应封门（锁死自己 = 全防线瘫痪）
+def test_gate_not_closed_when_pioneer_outside_before_window():
+    brain, turn = make_brain_turn(67)
+    # 封门前夕（rid<69）开拓者还没回圈 -> 不封门（锁死操控手 = 防线瘫痪）
     pioneer = turn.unit_by_id(10011)
     object.__setattr__(pioneer, "pos", Pos(25, 5))
     decision = Decision()
@@ -75,6 +75,28 @@ def test_gate_not_closed_when_someone_outside():
         command.get("action") != "build" or command.get("name") != "wall"
         for command in decision.commands.values()
     )
+
+
+def test_gate_closed_at_window_even_if_pioneer_outside():
+    brain, turn = make_brain_turn(69)
+    # 69-70 是最后窗口：保基地优先，晚归的角色门外躲避也要封门
+    pioneer = turn.unit_by_id(10011)
+    object.__setattr__(pioneer, "pos", Pos(25, 5))
+    decision = Decision()
+    brain._gate_evening(turn, decision, set(), set())
+    command = decision.commands.get(10010)
+    assert command is not None and command["action"] == "build"
+
+
+def test_gate_closed_with_worker_outside():
+    brain, turn = make_brain_turn(67)
+    # 夜矿工人被锁在门外是既定方针，不阻止封门
+    worker = turn.unit_by_id(10012)
+    object.__setattr__(worker, "pos", Pos(25, 5))
+    decision = Decision()
+    brain._gate_evening(turn, decision, set(), set())
+    command = decision.commands.get(10010)
+    assert command is not None and command["action"] == "build"
 
 
 def test_gate_not_closed_in_front_phase():

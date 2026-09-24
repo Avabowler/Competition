@@ -12,7 +12,8 @@
 import logging
 import math
 
-from .grid import next_step
+from .grid import approach_step, next_step
+from .memory import GameMemory
 from .protocol import (
     Decision,
     Pos,
@@ -24,6 +25,8 @@ from .protocol import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+MULTI_CONTROL_MAX_STREAKS = 3   # 聚控攻击连续整轮全失败 N 次后回退 1:1
 
 
 def line_cells(start: Pos, end: Pos) -> list[Pos]:
@@ -85,6 +88,9 @@ def _threat_score(turn: Turn, robot: Robot, station_pos: Pos | None) -> float:
 
 
 class Combat:
+    def __init__(self, memory: GameMemory) -> None:
+        self.memory = memory
+
     def plan_night(self, turn: Turn, decision: Decision, claimed: set[Pos],
                    exclude: set[int] | None = None) -> None:
         station = turn.station()
@@ -95,6 +101,11 @@ class Combat:
 
         if not weapons:
             self._hide(turn, roles, decision, claimed)
+            return
+
+        # 聚控优先：开拓者一人操控 cluster 内全部炮台（工人腾出去夜矿）
+        if self._cluster_control(turn, decision, claimed, weapons, roles,
+                                 exclude, station_pos):
             return
 
         # 每座武器的可站位格（相邻且可通行），操控配对按距离贪心：
@@ -167,6 +178,85 @@ class Combat:
                 decision.commands[role.unit_id] = {
                     "action": "move", "targetPos": [{"x": step.x, "y": step.y}],
                 }
+
+    # ---- 聚控：开拓者一人操控三塔
+
+    def _cluster_control(self, turn: Turn, decision: Decision, claimed: set[Pos],
+                         weapons: tuple[Unit, ...], roles: list[Unit],
+                         exclude: set[int], station_pos: Pos | None) -> bool:
+        """开拓者站控制位同时操控相邻的多座炮台。返回是否接管了本回合夜战。"""
+        if self.memory.multi_control_failed:
+            return False
+        seat = self.memory.tower_seat
+        if seat is None:
+            return False
+        seat_pos = Pos(*seat)
+        pioneer = next(
+            (r for r in roles if r.kind == "pioneer"), None,
+        )
+        if pioneer is None:
+            return False
+        cluster = [w for w in weapons if distance(w.pos, seat_pos) <= 1]
+        if len(cluster) < 2:
+            return False       # 聚控布局不存在（少于 2 座塔相邻控制位）
+
+        self._track_multi_control_health(cluster)
+
+        if distance(pioneer.pos, seat_pos) > 1 \
+                and pioneer.unit_id not in decision.commands:
+            step = next_step(turn, pioneer, seat_pos) \
+                or approach_step(turn, pioneer, seat_pos)
+            if step is not None and step not in claimed:
+                claimed.add(step)
+                decision.commands[pioneer.unit_id] = {
+                    "action": "move", "targetPos": [{"x": step.x, "y": step.y}],
+                }
+        # 错峰轮发：火箭冷却同为 3 回合，每回合只开一门（轮转），
+        # 形成"每回合一发"的不间断火力，也避免多弹同时砸同一目标造成过量
+        ready: list[tuple[Unit, list[Pos]]] = []
+        for weapon in cluster:
+            if weapon.cooldown > 0 or distance(pioneer.pos, weapon.pos) > 1:
+                continue
+            targets = self._targets_for(turn, weapon, station_pos)
+            if targets:
+                ready.append((weapon, targets))
+        if ready:
+            weapon, targets = ready[self.memory.fire_rotate % len(ready)]
+            self.memory.fire_rotate += 1
+            decision.commands[weapon.unit_id] = cmd_attack(
+                pioneer.unit_id, targets,
+            )
+        # 其余未被 exclude 的角色（如 multi_ok 下没去夜矿的工人）跟随第一座塔待命
+        for role in roles:
+            if role.unit_id == pioneer.unit_id or role.unit_id in decision.commands:
+                continue
+            goal = cluster[0].pos
+            if distance(role.pos, goal) <= 1:
+                continue
+            step = next_step(turn, role, goal)
+            if step is not None and step not in claimed:
+                claimed.add(step)
+                decision.commands[role.unit_id] = {
+                    "action": "move", "targetPos": [{"x": step.x, "y": step.y}],
+                }
+        return True
+
+    def _track_multi_control_health(self, cluster: list[Unit]) -> None:
+        """上回合聚控攻击若"发了却全失败"计一次连续失败；连续 N 次回退 1:1。"""
+        issued = [
+            w.unit_id for w in cluster
+            if self.memory.last_commands.get(w.unit_id, {}).get("action") == "attack"
+        ]
+        if not issued:
+            return
+        if any(unit_id in self.memory.failed_actions for unit_id in issued):
+            self.memory.multi_control_failures += 1
+        else:
+            self.memory.multi_control_failures = 0
+        if self.memory.multi_control_failures >= MULTI_CONTROL_MAX_STREAKS:
+            self.memory.multi_control_failed = True
+            self.memory.multi_control_failures = 0
+            LOGGER.warning("multi-control reverted to 1:1 after repeated failures")
 
     # ---- 各武器目标选择
 

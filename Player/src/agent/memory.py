@@ -6,7 +6,9 @@ HTTP 层是多线程的，Brain 外层有全局锁，这里不再加锁。
 from dataclasses import dataclass, field
 from typing import Any
 
-from .protocol import LLM_FREE_PER_DAY, Turn
+from .protocol import LLM_FREE_PER_DAY, Pos, Turn, VISION_RANGE, distance
+
+ZONE_FULL_MAP_THRESHOLD = 8   # 原始 payload zones 少于此数视为"视野过滤世界"
 
 
 @dataclass(slots=True)
@@ -117,6 +119,18 @@ class GameMemory:
     failed_actions: dict[int, dict[str, Any]] = field(default_factory=dict)  # 上回合失败的指令
     build_failures: set[tuple[int, int]] = field(default_factory=set)  # 试过不可建造的格子
 
+    # 区块记忆：矿/商店位置跨回合留存（防判题器视野过滤；全图下发时近似无操作）
+    zone_memory: dict[tuple[int, int], tuple[str, int]] = field(default_factory=dict)
+    # ^ pos -> (neutralType, last_seen_round)；进入视野却消失即失效
+    explored: set[tuple[int, int]] = field(default_factory=set)
+    exploration_mode: bool | None = None   # None=未判定，首回合按 payload zones 数量判定
+
+    # 三塔聚控：控制位（开拓者夜间站位）
+    tower_seat: tuple[int, int] | None = None
+    multi_control_failures: int = 0        # 聚控攻击连续整轮失败次数
+    multi_control_failed: bool = False     # 置真后永久回退 1:1 操控配对
+    fire_rotate: int = 0                   # 错峰轮发游标（每回合轮转一门火箭）
+
     def begin_round(self, turn: Turn) -> None:
         new_day = turn.day != self.day
         if new_day:
@@ -147,6 +161,64 @@ class GameMemory:
             self.news_archive.setdefault(
                 turn.day, (news.official, news.folk),
             )
+
+    # ---- 区块记忆与探索
+
+    def observe_zones(self, turn: Turn) -> None:
+        """合并 payload zones 到持久记忆；视野内却消失的记忆项失效。"""
+        if self.exploration_mode is None:
+            # 首回合判定：全图下发世界 payload 就有全部中立元素
+            self.exploration_mode = len(turn.zones) < ZONE_FULL_MAP_THRESHOLD
+        visible: set[tuple[int, int]] = set()
+        for pos, kind in turn.zones.items():
+            self.zone_memory[(pos.x, pos.y)] = (kind, turn.round_no)
+            visible.add((pos.x, pos.y))
+        for key in list(self.zone_memory):
+            pos = Pos(*key)
+            if key not in visible and any(
+                distance(pos, u.pos) <= VISION_RANGE for u in turn.ours
+            ):
+                del self.zone_memory[key]
+
+    def observe_explored(self, turn: Turn) -> None:
+        """记录所有曾进入任一己方单位视野的格子。"""
+        for unit in turn.ours:
+            for dx in range(-VISION_RANGE, VISION_RANGE + 1):
+                for dy in range(-VISION_RANGE, VISION_RANGE + 1):
+                    pos = Pos(unit.pos.x + dx, unit.pos.y + dy)
+                    if pos.within(turn.width, turn.height):
+                        self.explored.add((pos.x, pos.y))
+
+    def effective_zones(self, turn: Turn) -> dict[Pos, str]:
+        """payload zones ∪ 记忆中未失效项，供决策层统一使用。"""
+        merged = dict(turn.zones)
+        for key, (kind, _) in self.zone_memory.items():
+            merged.setdefault(Pos(*key), kind)
+        return merged
+
+    def exploration_done(self, turn: Turn) -> bool:
+        """全图下发世界无需探索；过滤世界集齐 石矿+小贩+武器商店 即可开工。"""
+        if not self.exploration_mode:
+            return True
+        kinds = {kind for kind, _ in self.zone_memory.values()}
+        kinds.update(turn.zones.values())
+        return {"stone", "vendor", "weaponShop"} <= kinds
+
+    def explore_targets(self, turn: Turn) -> list[Pos]:
+        """前沿探索候选：与未探索格相邻的可通行格。"""
+        blocked = turn.blocked(None)
+        candidates: set[Pos] = set()
+        for x, y in self.explored:
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if not dx and not dy:
+                        continue
+                    pos = Pos(x + dx, y + dy)
+                    if (pos.x, pos.y) not in self.explored \
+                            and pos.within(turn.width, turn.height) \
+                            and pos not in blocked:
+                        candidates.add(pos)
+        return sorted(candidates, key=lambda p: (p.x, p.y))
 
     # ---- LLM 预算
 

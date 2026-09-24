@@ -19,11 +19,11 @@ src/agent/
 ├── protocol.py     # request 全字段解析 + 游戏常量表 + 指令构造器
 ├── validator.py    # 出站指令硬校验（防"异常响应"红线的最后防线）
 ├── memory.py       # 跨回合状态：LLM 预算/新闻归档/SOP 库/关门状态/炮台 loadout
-├── grid.py         # A* 寻路（8 向、切比雪夫）
+├── grid.py         # A* 寻路（8 向、切比雪夫）+ 不可达时 best-effort 逼近
 ├── items.py        # 物品使用：应急炸弹/眩晕、药剂、召唤令、修墙（买→用闭环）
-├── economy.py      # 采矿分工/贩卖/升级序列/券配送/回家 deadline
-├── build.py        # 炮台位连通性选址 + 围墙防线 + 门口坐标
-├── combat.py       # 夜战：锥形多目标/穿透/溅射叠弹、按站位格贪心配对
+├── economy.py      # 采矿分工（近到远遍历）/昼夜经济链/躲避/券配送/升级序列
+├── build.py        # 三塔聚控选址（控制位+走廊连通）+ 围墙防线 + 门口坐标
+├── combat.py       # 夜战：全火箭编成错峰轮发（每回合一发）、开拓者聚控+失败回退
 ├── brain_baseline.py  # Demo 原版策略（A/B 回归基线，不参与正式决策）
 └── tasks/
     ├── evolve.py   # 自进化任务：LLM 主导 + 多格式解析链 + 强制提交 + SOP

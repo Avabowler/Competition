@@ -1,15 +1,16 @@
-"""经济系统：工人分工采矿、贩卖回城、按购物清单购买与使用。
+"""经济系统：工人分工采矿、贩卖、按购物清单购买与使用。
 
-分工：每名工人有固定职责（存于 Brain.assignments）：
+分工（Brain.assignments 每回合重算）：
 - stone：专职石头（围墙材料 + 修复储备）
 - metal：铜/铁（按当前价格与新闻预测选矿，满载后去小贩贩卖顺路购物）
 
 白天 70 回合的节奏：采矿 -> 背包达阈值 -> 去小贩 -> 卖 -> （金币够且有购物单）去武器商店买 -> 使用/返程。
+夜晚工人不归位：躲避机器人后继续 夜间经济链（plan_night_worker），通宵采矿。
 """
 import logging
 
-from .build import front_cells, towers_pending, walls_pending
-from .grid import next_step
+from .build import entrance_pos, front_cells, walls_pending
+from .grid import approach_step, next_step
 from .items import building_max_health
 from .memory import GameMemory
 from .protocol import (
@@ -112,25 +113,75 @@ class Economy:
         # 携带升级券的人最优先送券到目标建筑并使用（否则券会一直压在背包里）
         if self._deliver_vouchers(turn, worker, decision, claimed):
             return
-        # 关门前的回家 deadline：时间不够走回去就立刻动身（关门战术的保命前提）
-        station = turn.station()
-        if station is not None and turn.round_in_day >= HOMEBOUND_ROUND:
-            from .build import footprint_distance
-            from .protocol import station_footprint
-            home_gap = footprint_distance(worker.pos, station_footprint(station.pos))
-            if turn.round_in_day + home_gap >= GATE_CLOSE_ROUND:
-                step = next_step(turn, worker, station.pos)
-                if step is not None and step not in claimed:
-                    claimed.add(step)
-                    decision.commands[worker.unit_id] = {
-                        "action": "move",
-                        "targetPos": [{"x": step.x, "y": step.y}],
-                    }
-                    return
         if role == "stone":
             self._stone_worker(turn, worker, decision, claimed, build_slots)
         else:
             self._metal_worker(turn, worker, decision, claimed, build_slots)
+
+    def plan_night_worker(self, turn: Turn, worker: Unit, role: str,
+                          decision: Decision, claimed: set[Pos]) -> None:
+        """夜间经济链：躲避 > 送券 > 满载贩卖购物 > 近处采矿（build 夜间非法）。
+
+        夜矿只采基地 NIGHT_MINE_RADIUS 半径内的矿；近处无矿时向基地收拢，
+        不为远矿整夜脱离防守圈。"""
+        if self.evade_robots(turn, worker, decision, claimed):
+            return
+        if self._deliver_vouchers(turn, worker, decision, claimed):
+            return
+        load = sum(
+            worker.backpack.count(o) for o in ("copper", "iron", "stone")
+        )
+        night_ending = turn.round_in_day >= NIGHT_SELL_DEADLINE
+        if load >= SELL_BATCH or (night_ending and load > 0) or \
+                (worker.capacity and load >= worker.capacity - 2):
+            keep = "stone" if role == "stone" else None
+            if self._sell_trip(turn, worker, decision, claimed, keep_ore=keep):
+                return
+        if role == "stone":
+            ore = "stone"
+        else:
+            ore = choose_metal_ore(turn, self.memory, worker)
+        station = turn.station()
+        center = station.pos if station is not None else None
+        if self._mine_round(turn, worker, ore, decision, claimed,
+                            center=center, max_dist=NIGHT_MINE_RADIUS):
+            return
+        # 近处无矿：向基地收拢（抵达防守圈附近后交给战斗模块收编守塔）
+        if station is not None and distance(worker.pos, station.pos) > 4:
+            step = next_step(turn, worker, station.pos) \
+                or approach_step(turn, worker, station.pos)
+            if step is not None and step not in claimed:
+                claimed.add(step)
+                decision.commands[worker.unit_id] = {
+                    "action": "move", "targetPos": [{"x": step.x, "y": step.y}],
+                }
+            return
+        self.fallback_move(turn, worker, decision, claimed)
+
+    def evade_robots(self, turn: Turn, worker: Unit, decision: Decision,
+                     claimed: set[Pos]) -> bool:
+        """机器人进入警戒圈（射程 3 + 1 格余量）时远离其包围，返回是否规避。"""
+        threats = [
+            r for r in turn.robots
+            if r.health > 0 and distance(worker.pos, r.pos) <= EVADE_ROBOT_RANGE
+        ]
+        if not threats:
+            return False
+        blocked = turn.blocked(worker)
+        best: tuple[tuple[int, int, int], Pos] | None = None
+        for n in worker.pos.neighbours():
+            if not turn.on_map(n) or n in blocked or n in claimed:
+                continue
+            clearance = min(distance(n, t.pos) for t in threats)
+            key = (-clearance, n.x, n.y)
+            if best is None or key < best[0]:
+                best = (key, n)
+        if best is None:
+            return False
+        decision.commands[worker.unit_id] = {
+            "action": "move", "targetPos": [{"x": best[1].x, "y": best[1].y}],
+        }
+        return True
 
     def _deliver_vouchers(self, turn: Turn, worker: Unit, decision: Decision,
                           claimed: set[Pos]) -> bool:
@@ -154,41 +205,75 @@ class Economy:
             return True
         return False
 
-    # ---- 石头工人：先炮台后围墙，其余时间采石
+    # ---- 石头工人：半圈未合拢时墙先于塔，其余时间采石
 
     def _stone_worker(self, turn: Turn, worker: Unit, decision: Decision,
                       claimed: set[Pos], build_slots: list[tuple[Pos, str]]) -> None:
         memory = self.memory
         stones = worker.backpack.count("stone")
-
-        # 1) 炮台优先（金币足够）
+        # 封门 deadline：石头工是封门建造者，时间不够走到门口就立刻动身
+        # （金属工保持通宵夜矿不受影响；黄昏 64-70 brain._gate_evening 优先接管，
+        #   它提前返回时这里继续兜底走位）
+        if memory.gate.enabled and memory.wall_phase == "full" \
+                and turn.round_in_day >= GATE_BUILDER_ROUND:
+            gate_pos = entrance_pos(turn)
+            if gate_pos is not None and distance(worker.pos, gate_pos) > 1:
+                gap = distance(worker.pos, gate_pos)
+                if turn.round_in_day + gap >= GATE_CLOSE_ROUND - 1:
+                    step = next_step(turn, worker, gate_pos) \
+                        or approach_step(turn, worker, gate_pos)
+                    if step is not None and step not in claimed:
+                        claimed.add(step)
+                        decision.commands[worker.unit_id] = {
+                            "action": "move",
+                            "targetPos": [{"x": step.x, "y": step.y}],
+                        }
+                        return
         pending_towers = [slot for slot in build_slots if slot[1] != "wall"]
-        if pending_towers and turn.gold >= WEAPON_BUILD_COST:
-            for site, name in pending_towers:
-                if distance(worker.pos, site) <= 1 and worker.pos != site:
-                    decision.commands[worker.unit_id] = cmd_build(name, site)
-                    return
-            site, name = pending_towers[0]
-            if _walk_or_reach(turn, worker, [site], decision, claimed):
-                return
-
-        # 2) 围墙补建（建"与工人相邻"的那段，而不是列表第一段）
         pending_walls = [slot for slot in build_slots if slot[1] == "wall"]
-        if pending_walls and stones > 0:
-            for site, name in pending_walls:
-                if distance(worker.pos, site) <= 1:
-                    decision.commands[worker.unit_id] = cmd_build(name, site)
-                    return
-            target = pending_walls[0][0]
-            if _walk_or_reach(turn, worker, [target], decision, claimed):
-                return
+        # 正面半圈未合拢 -> 防线缺口是最大威胁，围墙优先于炮台
+        ring_open = not memory.ring_completed and memory.wall_phase == "front"
+        first, second = (
+            (self._try_walls, self._try_towers) if ring_open
+            else (self._try_towers, self._try_walls)
+        )
+        if first(turn, worker, decision, claimed, pending_towers,
+                 pending_walls, stones):
+            return
+        if second(turn, worker, decision, claimed, pending_towers,
+                  pending_walls, stones):
+            return
 
         # 3) 采石 / 修墙物资（无墙可建或走不过去也采矿，防原地发呆）
-        if self._mine_round(turn, worker, "stone", decision):
+        if self._mine_round(turn, worker, "stone", decision, claimed):
             return
 
         # 4) 围墙已齐且石头富余 -> 去卖掉多余的石头
         self._sell_trip(turn, worker, decision, claimed, keep_ore="stone")
+
+    def _try_towers(self, turn: Turn, worker: Unit, decision: Decision,
+                    claimed: set[Pos], pending_towers: list[tuple[Pos, str]],
+                    pending_walls: list[tuple[Pos, str]], stones: int) -> bool:
+        if not (pending_towers and turn.gold >= WEAPON_BUILD_COST):
+            return False
+        for site, name in pending_towers:
+            if distance(worker.pos, site) <= 1 and worker.pos != site:
+                decision.commands[worker.unit_id] = cmd_build(name, site)
+                return True
+        site, name = pending_towers[0]
+        return _walk_or_reach(turn, worker, [site], decision, claimed)
+
+    def _try_walls(self, turn: Turn, worker: Unit, decision: Decision,
+                   claimed: set[Pos], pending_towers: list[tuple[Pos, str]],
+                   pending_walls: list[tuple[Pos, str]], stones: int) -> bool:
+        if not (pending_walls and stones > 0):
+            return False
+        for site, name in pending_walls:
+            if distance(worker.pos, site) <= 1:
+                decision.commands[worker.unit_id] = cmd_build(name, site)
+                return True
+        target = pending_walls[0][0]
+        return _walk_or_reach(turn, worker, [target], decision, claimed)
 
     # ---- 金属工人：高价矿 -> 满载贩卖 -> 购物
 
@@ -216,27 +301,42 @@ class Economy:
                 return
 
         ore = choose_metal_ore(turn, memory, worker)
-        if self._mine_round(turn, worker, ore, decision):
+        if self._mine_round(turn, worker, ore, decision, claimed):
             return
         # 无矿可采：随大流去小贩（顺路购物）
         self._sell_trip(turn, worker, decision, claimed, keep_ore=None)
 
     # ---- 通用动作
 
-    def _mine_round(self, turn: Turn, worker: Unit, ore: str, decision: Decision) -> bool:
+    def _mine_round(self, turn: Turn, worker: Unit, ore: str, decision: Decision,
+                    claimed: set[Pos] | None = None,
+                    center: Pos | None = None, max_dist: int | None = None) -> bool:
+        claimed = claimed if claimed is not None else set()
         mines = turn.mines_of(ore)
+        if center is not None and max_dist is not None:
+            mines = [m for m in mines if distance(center, m) <= max_dist]
         if not mines:
             return False
         if worker.capacity is not None and len(worker.backpack) >= worker.capacity:
             return False
-        adjacent = [m for m in mines if distance(worker.pos, m) <= 1]
+        # 从近到远逐个尝试：最近的矿不可达（邻格被占/被隔）就换下一个，
+        # 绝不因单个矿点而整体放弃；全部真路径失败才 best-effort 逼近最近的
+        ordered = sorted(mines, key=lambda m: (distance(worker.pos, m), m.x, m.y))
+        adjacent = [m for m in ordered if distance(worker.pos, m) <= 1]
         if adjacent:
-            target = min(adjacent, key=lambda m: (m.x, m.y))
-            decision.commands[worker.unit_id] = cmd_collect(target)
+            decision.commands[worker.unit_id] = cmd_collect(adjacent[0])
             return True
-        target = min(mines, key=lambda m: (distance(worker.pos, m), m.x, m.y))
-        step = next_step(turn, worker, target)
-        if step is not None:
+        for target in ordered:
+            step = next_step(turn, worker, target)
+            if step is not None and step not in claimed:
+                claimed.add(step)
+                decision.commands[worker.unit_id] = {
+                    "action": "move", "targetPos": [{"x": step.x, "y": step.y}],
+                }
+                return True
+        step = approach_step(turn, worker, ordered[0])
+        if step is not None and step not in claimed:
+            claimed.add(step)
             decision.commands[worker.unit_id] = {
                 "action": "move", "targetPos": [{"x": step.x, "y": step.y}],
             }
@@ -388,23 +488,37 @@ class Economy:
 
     def fallback_move(self, turn: Turn, worker: Unit, decision: Decision,
                       claimed: set[Pos]) -> None:
-        """空闲工人保底移动：最近矿区 -> 小贩 -> 基地，绝不原地发呆。"""
-        for targets in (turn.mines(), list(turn.vendors())):
+        """空闲工人保底移动：从近到远遍历矿区 -> 小贩，绝不原地发呆。"""
+        groups = ((turn.mines(), True), (list(turn.vendors()), False))
+        for targets, skip_if_adjacent in groups:
             if not targets:
                 continue
-            target = min(
+            ordered = sorted(
                 targets, key=lambda p: (distance(worker.pos, p), p.x, p.y),
             )
-            if distance(worker.pos, target) <= 1:
-                continue          # 已就位（下回合会有具体动作）
-            step = next_step(turn, worker, target)
+            if skip_if_adjacent and distance(worker.pos, ordered[0]) <= 1:
+                break              # 已就位（下回合会有具体动作），转下一类目标
+            for target in ordered:
+                step = next_step(turn, worker, target)
+                if step is not None and step not in claimed:
+                    claimed.add(step)
+                    decision.commands[worker.unit_id] = {
+                        "action": "move",
+                        "targetPos": [{"x": step.x, "y": step.y}],
+                    }
+                    return
+        # 全部目标不可达：朝最近的矿区 best-effort 逼近（堵塞一解除即接上）
+        mines = sorted(
+            turn.mines(), key=lambda p: (distance(worker.pos, p), p.x, p.y),
+        )
+        if mines:
+            step = approach_step(turn, worker, mines[0])
             if step is not None and step not in claimed:
                 claimed.add(step)
                 decision.commands[worker.unit_id] = {
                     "action": "move",
                     "targetPos": [{"x": step.x, "y": step.y}],
                 }
-                return
 
     # ---- 升级券使用（走到目标建筑旁使用；目标选血量最低的）
 
@@ -452,7 +566,11 @@ class Economy:
 
 
 DAY_SELL_DEADLINE = 60     # 白天第 60 回合后金属工人开始收尾贩卖
-GOLD_TRIP_LINE = 100       # 金币到该值就跑商店（=首座塔升级券价格，保首日升级）
+GOLD_TRIP_LINE = 175       # 金币到该值就跑商店（=L3 升级券 150 + 保底 25，避免在
+                           # 100 档反复小采购、攒不下 L3 券；首日 L2 由富余自然触发）
 RESTOCK_ITEMS = ("WallFixer", "Bomb", "DizzyWeapon", "Medicine")
-HOMEBOUND_ROUND = 60       # 白天该回合起按"能否在封门前到家"决定是否动身
-GATE_CLOSE_ROUND = 69      # 与 brain.GATE_CLOSE_ROUND 保持一致
+NIGHT_SELL_DEADLINE = 124  # 夜晚（71-130）该回合起收尾贩卖，别把矿背过夜
+EVADE_ROBOT_RANGE = 4      # 机器人射程 3 + 1 格余量，进入即规避
+NIGHT_MINE_RADIUS = 12     # 夜矿范围：只采基地此半径内的矿，远矿留给白天
+GATE_BUILDER_ROUND = 58    # 石头工（封门建造者）该回合起按"能否赶到门口"决定动身
+GATE_CLOSE_ROUND = 69      # 封门时间窗（69-70），与 brain.GATE_CLOSE_ROUND 一致
