@@ -181,9 +181,13 @@ class Brain:
                 self.memory.ring_completed = True
                 LOGGER.info("front wall ring completed")
 
-        # 阶段流转：有塔升到 2 级或第 4 天起，从"半圈"扩为"整圈"
+        # 阶段流转：半圈一旦合拢立即扩为整圈（机器人会从未设防方向绕袭，
+        # 半圈合拢后石头工无缝续建其余三面；封门战术也随之提前启用）。
+        # 有塔升到 2 级或第 4 天起同样强制整圈（兜底）。
         if self.memory.wall_phase == "front" and (
-            any(w.level >= 2 for w in turn.weapons()) or turn.day >= 4
+            self.memory.ring_completed
+            or any(w.level >= 2 for w in turn.weapons())
+            or turn.day >= 4
         ):
             self.memory.wall_phase = "full"
             LOGGER.info("wall phase -> full")

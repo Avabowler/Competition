@@ -117,14 +117,16 @@ def _seat_corridor_ok(seat: Pos, towers: set[Pos], candidates: list[Pos],
 
 def cluster_plan(turn: Turn,
                  memory: GameMemory | None) -> tuple[Pos, list[Pos]] | None:
-    """三塔聚控布局：返回 (控制位 S, 三塔坐标)。
+    """聚控布局：返回 (控制位 S, 塔位 2~3 座)。
 
-    约束：S 与三塔均为 ring1 候选、三塔与 S 切比雪夫距离 <=1、
-    S 经 ring1 空格从门口可达。评分：延续旧座位（稳定）> 座位贴近门口
-    （背侧，远离来袭方向保开拓者）> 确定性。
+    约束：S 与塔均为 ring1 候选、塔与 S 切比雪夫距离 <=1、
+    S 经 ring1 空格从门口可达。几何上与同一格相邻的塔必然呈三角/弧形
+    包围 S（三塔共线则不存在公共邻格），评分：
+    塔数(3>2) > 延续旧座位（稳定）> 正交邻格数（三角形"两翼各一塔，
+    开拓者居中打两边"）> 座位贴近门口（背侧，远离来袭方向保开拓者）。
     """
     candidates = _ring1_candidates(turn, memory)
-    if len(candidates) < 4:
+    if len(candidates) < 3:
         return None
     occupied = turn.occupied_cells()
     door = entrance_pos(turn)
@@ -133,26 +135,31 @@ def cluster_plan(turn: Turn,
         if memory is not None and memory.tower_seat else None
     )
     best: tuple[Pos, list[Pos]] | None = None
-    best_score: tuple[int, int] | None = None
+    best_score: tuple[int, int, int, int] | None = None
+    orth4 = ((0, 1), (0, -1), (1, 0), (-1, 0))
     for seat in candidates:
         if seat in occupied:
             continue          # 控制位必须可站立（不能压在已有建筑上）
         adjacent = [
             c for c in candidates if c != seat and distance(c, seat) <= 1
         ]
-        if len(adjacent) < 3:
+        if len(adjacent) < 2:
             continue
-        for towers in combinations(adjacent, 3):
-            if not _seat_corridor_ok(seat, set(towers), candidates, door):
+        for size in (3, 2):
+            if len(adjacent) < size:
                 continue
-            stable = 1 if prev_seat is not None and seat == prev_seat else 0
-            door_affinity = -distance(seat, door) if door is not None else 0
-            # 座位贴近门口（背侧）：远离机器人来袭方向保开拓者，
-            # 射程不足的加特林损失由火箭(10)/电磁炮(6+)的全局射程补足
-            score = (stable, door_affinity)
-            if best_score is None or score > best_score:
-                best_score = score
-                best = (seat, list(towers))
+            for towers in combinations(adjacent, size):
+                if not _seat_corridor_ok(seat, set(towers), candidates, door):
+                    continue
+                stable = 1 if prev_seat is not None and seat == prev_seat else 0
+                orth = sum(
+                    1 for t in towers if (t.x - seat.x, t.y - seat.y) in orth4
+                )
+                door_affinity = -distance(seat, door) if door is not None else 0
+                score = (len(towers), stable, orth, door_affinity)
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best = (seat, list(towers))
     return best
 
 

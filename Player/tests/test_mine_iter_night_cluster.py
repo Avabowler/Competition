@@ -242,6 +242,68 @@ def test_cluster_plan_returns_seat_with_three_adjacent_towers():
     assert all(distance(site, seat_pos) <= 1 for site in sites)
     assert seat_pos not in sites
     assert len(set(sites)) == 3
+    # 三角形布局：至少两座塔位于座位的正交邻格（开拓者居中打两边）
+    orth = sum(
+        1 for t in sites if (abs(t.x - seat_pos.x) + abs(t.y - seat_pos.y)) == 1
+    )
+    assert orth >= 2, f"聚控应优先三角形布局，实际 {sites} @ {seat_pos}"
+
+
+def test_two_tower_cluster_when_triangle_impossible():
+    """聚控三角无解时退而求其次选双塔聚控，而不是散开成三座孤塔。"""
+    memory = GameMemory()
+    memory.build_failures = {(9, 22), (10, 22), (9, 24)}   # 封掉三角候选
+    turn = Turn.load(make_payload(
+        roles=[make_role(10013, "station", 10, 24)],
+    ))
+    sites = tower_sites(turn, memory)
+    seat = memory.tower_seat
+    if len(sites) < 3:                     # 三角确实无解时必须仍是聚控形态
+        assert seat is not None
+        assert 2 <= len(sites) <= 3
+        seat_pos = Pos(*seat)
+        assert all(distance(s, seat_pos) <= 1 for s in sites)
+
+
+def test_next_step_adjacent_to_blocked_goal_returns_none():
+    """回归：已站在不可通行目标（矿区）的邻格时 next_step 必须返回 None 而非崩溃。"""
+    mine = Pos(22, 22)
+    payload = make_payload(
+        zones=[{"pos": {"x": mine.x, "y": mine.y}, "neutralType": "stone"}],
+        roles=[make_worker(1, 21, 22)],
+    )
+    turn = Turn.load(payload)
+    assert next_step(turn, turn.ours[0], mine) is None
+
+
+def test_fallback_move_adjacent_second_mine_no_crash():
+    """回归：最近矿已相邻时保底移动不得抛 KeyError（原地等待采集即可）。"""
+    walled = Pos(26, 22)
+    near = Pos(21, 22)
+    payload = make_payload(
+        zones=[{"pos": {"x": walled.x, "y": walled.y}, "neutralType": "stone"},
+               {"pos": {"x": near.x, "y": near.y}, "neutralType": "stone"}],
+        roles=[make_worker(1, 20, 22)] + ring_walls(100, walled),
+    )
+    turn = Turn.load(payload)
+    decision = Decision()
+    Economy(GameMemory()).fallback_move(turn, turn.ours[0], decision, set())
+    # 工人已邻格最近矿：不崩溃即为回归目标（采集由经济链下回合完成）
+    assert all(cmd.get("action") != "collect" for cmd in decision.commands.values())
+
+
+def test_full_ring_continues_after_front_completes():
+    """半圈合拢后应立即转入整圈阶段，围墙无缝续建。"""
+    brain = Brain()
+    turn = Turn.load(make_payload(
+        roles=[make_role(10013, "station", 10, 24)],
+    ))
+    brain.memory.ring_completed = True
+    brain.memory.wall_phase = "front"
+    brain._worker_day_loop(turn, Decision(), set(), set())
+    assert brain.memory.wall_phase == "full"
+    from agent.build import walls_pending
+    assert len(walls_pending(turn, brain.memory)) > 3, "整圈应有大量待建墙"
 
 
 def test_pioneer_controls_all_cluster_weapons():

@@ -37,6 +37,8 @@ def next_step(turn: Turn, moving: Unit, goal: Pos | set[Pos] | frozenset[Pos]) -
         }
         if not passable_goals:
             return None
+    if moving.pos in passable_goals:
+        return None          # 已站上目标邻格（目标本身不可通行），无需移动
 
     order = count()
     frontier: list[tuple[int, int, int, Pos]] = [
