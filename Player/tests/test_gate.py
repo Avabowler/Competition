@@ -99,3 +99,32 @@ def test_entrance_pos_matches_wall_plan():
     brain, turn = make_brain_turn(10)
     door = entrance_pos(turn)
     assert door is not None and (door.x, door.y) == (8, 22)
+
+
+def test_gate_removal_survives_economy_overwrite():
+    """回归：清晨拆门指令不得被工人经济循环覆盖（覆盖=全队被困圈内冻结）。"""
+    payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    payload["roundNo"] = 3
+    for role in payload["teamOur"]["roles"]:
+        if role["id"] == 10010:
+            role["pos"] = {"x": 9, "y": 21}
+            role["backpack"] = ["stone"]
+        if role["id"] in (10011, 10012):
+            role["pos"] = {"x": 12, "y": 22}
+    payload["teamOur"]["roles"].append({
+        "id": 40050, "pos": {"x": 8, "y": 22}, "roleType": "wall",
+        "health": 1000, "attackPower": 0, "attackRange": 0, "level": 1,
+        "backPackCapability": 0, "backpack": [],
+    })
+    turn = Turn.load(payload)
+    brain = Brain()
+    brain.worker_jobs[10010] = "stone"
+    brain.memory.wall_phase = "full"
+    brain.memory.gate.pos = (8, 22)
+
+    decision = Decision()
+    brain._day(turn, decision)          # 完整白天流程（含经济循环）
+    command = decision.commands.get(10010)
+    assert command is not None and command["action"] == "remove", \
+        f"拆门指令被覆盖为: {command}"
+    assert command["targetPos"][0] == {"x": 8, "y": 22}

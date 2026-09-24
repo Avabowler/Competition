@@ -106,7 +106,9 @@ class Brain:
         build_slots = tower_slots + wall_slots
 
         for worker in workers:
-            if worker.unit_id in handled:
+            # handled=物品动作占用；已有指令=清晨拆门等前置动作已规划
+            # （不跳过会被 plan_worker 覆盖，导致门墙永远拆不掉、全队被困圈内）
+            if worker.unit_id in handled or worker.unit_id in decision.commands:
                 continue
             job = self.worker_jobs.get(worker.unit_id, "metal")
             self.economy.plan_worker(
@@ -135,6 +137,21 @@ class Brain:
                 used = self.treasure.plan(turn, decision, claimed)
             if not used and pioneer.unit_id not in decision.commands:
                 self.economy.use_vouchers(turn, [pioneer], decision, claimed)
+
+        # 开拓者空闲兜底：无指令且远离基地时走回基地（防原地冻结，夜晚就近归位）
+        if pioneer is not None and pioneer.unit_id not in decision.commands \
+                and self.memory.evolve.phase == "idle":
+            station = turn.station()
+            if station is not None:
+                fp = station_footprint(station.pos)
+                if min(distance(pioneer.pos, c) for c in fp) > 2:
+                    step = next_step(turn, pioneer, station.pos)
+                    if step is not None and step not in claimed:
+                        claimed.add(step)
+                        decision.commands[pioneer.unit_id] = {
+                            "action": "move",
+                            "targetPos": [{"x": step.x, "y": step.y}],
+                        }
 
         # 工人空闲时把身上的升级券用掉
         idle_roles = [
@@ -288,10 +305,12 @@ class Brain:
             return
         if distance(builder.pos, gate_pos) <= 1:
             decision.commands[builder.unit_id] = cmd_remove(gate_pos)
+            handled.add(builder.unit_id)   # 防止被工人经济循环覆盖
         else:
             step = next_step(turn, builder, gate_pos)
             if step is not None and step not in claimed:
                 claimed.add(step)
+                handled.add(builder.unit_id)
                 decision.commands[builder.unit_id] = {
                     "action": "move", "targetPos": [{"x": step.x, "y": step.y}],
                 }
