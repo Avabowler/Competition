@@ -9,7 +9,7 @@
 import logging
 from typing import Any
 
-from .build import entrance_pos, tower_sites, walls_pending
+from .build import entrance_pos, tower_sites, wall_ring, walls_pending
 from .combat import Combat
 from .economy import Economy
 from .grid import next_step
@@ -35,6 +35,8 @@ HARASS_GOLD_LINE = 600        # 金币富余线（防御优先，之后才骚扰
 DUSK_REGROUP_ROUND = 64       # 白天该回合起角色归位到夜间武器旁
 GATE_CLOSE_ROUND = 69         # 封门时间窗（69-70）
 GATE_OPEN_DEADLINE = 5        # 清晨拆门时间窗（1-5）
+WALLS_TASK_GATE = 8           # 待建墙 <= 该值才允许开拓者出远门做任务
+EVOLVE_FALLBACK_ROUND = 40    # 无论墙况，该回合起放行任务（不浪费全天）
 
 
 class Brain:
@@ -113,13 +115,28 @@ class Brain:
                 turn, worker, job, decision, claimed, build_slots,
             )
 
+        # 围墙圈首次合拢检测（差 2 格内视为合拢，容忍中立格缺口）
+        if not self.memory.ring_completed:
+            standing_walls = len(turn.walls())
+            if standing_walls >= len(wall_ring(turn)) - 2:
+                self.memory.ring_completed = True
+                LOGGER.info("wall ring completed (%d walls)", standing_walls)
+
         # 开拓者：任务 > 宝藏 > 升级券 > 待命
+        # 闸门：城墙缺口多时不开新任务（防线优先），最迟 40 回合放行
+        walls_gap = len(walls_pending(turn, self.memory))
+        task_gate_open = walls_gap <= WALLS_TASK_GATE \
+            or turn.round_in_day >= EVOLVE_FALLBACK_ROUND
         pioneer = turn.pioneer()
         if pioneer is not None and pioneer.unit_id not in handled \
                 and pioneer.unit_id not in decision.commands:
-            used = self.evolve.plan(turn, decision, claimed)
-            if not used and pioneer.unit_id not in decision.commands:
-                used = self.treasure.plan(turn, decision, claimed)
+            pioneer_idle = self.memory.evolve.phase == "idle"
+            used = False
+            if task_gate_open or not pioneer_idle:
+                # 解题/赶路中的任务不打断，只拦"新出发"
+                used = self.evolve.plan(turn, decision, claimed)
+                if not used and pioneer.unit_id not in decision.commands:
+                    used = self.treasure.plan(turn, decision, claimed)
             if not used and pioneer.unit_id not in decision.commands:
                 self.economy.use_vouchers(turn, [pioneer], decision, claimed)
 
@@ -171,24 +188,30 @@ class Brain:
             if site not in standing
         ]
 
+    BOTH_BUILD_THRESHOLD = 8      # 缺口 >= 该值且圈未合拢过时全员转建造
+
     def _assign_worker_jobs(self, turn: Turn) -> None:
+        """每回合重算分工（无粘滞状态）：
+        - 缺口 >= BOTH_BUILD_THRESHOLD：全员采石+建墙（缺口是最大威胁）；
+        - 否则 1 人石头工（建墙/备封门石），其余金属工。"""
         workers = turn.workers()
         if not workers:
             return
+        walls_gap = len(walls_pending(turn, self.memory))
+        # 全员抢建只在"围墙圈从未合拢过"且缺口很大时生效；
+        # 圈合拢一次后缺口只由石头工维修，金属工回归采矿（保升级资金）
+        if not self.memory.ring_completed and walls_gap >= self.BOTH_BUILD_THRESHOLD:
+            for worker in workers:
+                self.worker_jobs[worker.unit_id] = "stone"
+            return
         # 关门战术启用时石头工必须常备石头（每天 1 块封门）
-        stone_needed = bool(walls_pending(turn, self.memory)) or bool(
+        stone_needed = walls_gap > 0 or bool(
             tower_sites(turn, self.memory)
         ) or self.memory.gate.enabled
-        for worker in workers:
-            job = self.worker_jobs.get(worker.unit_id)
-            if job is None:
-                job = "stone" if stone_needed and len(
-                    [j for j in self.worker_jobs.values() if j == "stone"]
-                ) == 0 else "metal"
-                self.worker_jobs[worker.unit_id] = job
-        # 防线完工且关门不可用时石头工才转金属
-        if not stone_needed:
-            for worker in workers:
+        for index, worker in enumerate(workers):
+            if index == 0 and stone_needed:
+                self.worker_jobs[worker.unit_id] = "stone"
+            else:
                 self.worker_jobs[worker.unit_id] = "metal"
 
     # ---------------------------------------------------------------- 关门战术

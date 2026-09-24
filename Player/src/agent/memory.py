@@ -105,6 +105,8 @@ class GameMemory:
     last_emergency_round: int = -999       # 上次应急道具使用回合（冷却用）
     tower_plan: dict[tuple[int, int], str] = field(default_factory=dict)
     site_failures: dict[tuple[int, int], int] = field(default_factory=dict)
+    ring_completed: bool = False
+    # ^ 围墙圈是否曾合拢过（合拢后缺口只由石头工单修，金属工回归采矿）
     # ^ 炮台位->武器类型的持久映射（loadout 锚定，防站点列表漂移导致重复建同一武器）
 
     # 指令反馈

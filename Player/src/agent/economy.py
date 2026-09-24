@@ -183,7 +183,7 @@ class Economy:
             if _walk_or_reach(turn, worker, [target], decision, claimed):
                 return
 
-        # 3) 采石 / 修墙物资
+        # 3) 采石 / 修墙物资：攒一小批就回去建（快周转）
         if stones < STONE_RESERVE or not pending_walls:
             if self._mine_round(turn, worker, "stone", decision):
                 return
