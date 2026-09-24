@@ -35,8 +35,6 @@ HARASS_GOLD_LINE = 600        # 金币富余线（防御优先，之后才骚扰
 DUSK_REGROUP_ROUND = 64       # 白天该回合起角色归位到夜间武器旁
 GATE_CLOSE_ROUND = 69         # 封门时间窗（69-70）
 GATE_OPEN_DEADLINE = 5        # 清晨拆门时间窗（1-5）
-WALLS_TASK_GATE = 8           # 待建墙 <= 该值才允许开拓者出远门做任务
-EVOLVE_FALLBACK_ROUND = 40    # 无论墙况，该回合起放行任务（不浪费全天）
 
 
 class Brain:
@@ -128,21 +126,13 @@ class Brain:
             self.memory.wall_phase = "full"
             LOGGER.info("wall phase -> full")
 
-        # 开拓者：任务 > 宝藏 > 升级券 > 待命
-        # 闸门：城墙缺口多时不开新任务（防线优先），最迟 40 回合放行
-        walls_gap = len(walls_pending(turn, self.memory))
-        task_gate_open = walls_gap <= WALLS_TASK_GATE \
-            or turn.round_in_day >= EVOLVE_FALLBACK_ROUND
+        # 开拓者：任务 > 宝藏 > 升级券（始终以任务为先，冷却空窗就提前驻守）
         pioneer = turn.pioneer()
         if pioneer is not None and pioneer.unit_id not in handled \
                 and pioneer.unit_id not in decision.commands:
-            pioneer_idle = self.memory.evolve.phase == "idle"
-            used = False
-            if task_gate_open or not pioneer_idle:
-                # 解题/赶路中的任务不打断，只拦"新出发"
-                used = self.evolve.plan(turn, decision, claimed)
-                if not used and pioneer.unit_id not in decision.commands:
-                    used = self.treasure.plan(turn, decision, claimed)
+            used = self.evolve.plan(turn, decision, claimed)
+            if not used and pioneer.unit_id not in decision.commands:
+                used = self.treasure.plan(turn, decision, claimed)
             if not used and pioneer.unit_id not in decision.commands:
                 self.economy.use_vouchers(turn, [pioneer], decision, claimed)
 

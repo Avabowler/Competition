@@ -49,7 +49,8 @@ class EvolveTaskState:
     accept_retries: int = 0              # acceptTask 已发但未下发任务的连续次数
     parse_failures: int = 0              # llmResp 连续解析失败次数
     corrected_prompt_sent: bool = False  # 是否已发过"严格 JSON"修正 prompt
-    explore_index: int = 0               # 解析彻底失败时的兜底探索命令游标
+    explore_index: int = 0               # 兜底探索命令游标（循环使用）
+    llm_retry_round: int = 0             # 上次 LLM 重试回合（每 10 回合重试）
     sop_hint_used: bool = False          # 本任务是否命中 SOP（提示模式）
     sop_hint_injected: bool = False      # SOP 提示是否已注入过 prompt
     submit_attempts: int = 0

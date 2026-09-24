@@ -35,7 +35,7 @@ ACCEPT_DEADLINE = 55          # 白天第 55 回合后不再接新任务（保�
 TIMEOUT_SAFETY = 0.85         # 超时回合的 85% 处强制提交最优答案
 HISTORY_CHAR_LIMIT = 1200     # 喂给 LLM 的单条输出截断长度
 DANGER_DISTANCE = 7           # 夜晚机器人逼近该距离则弃任务保命
-WALK_GIVE_UP = 30             # 走了 30 回合还没到任务点则放弃本次
+WALK_GIVE_UP = 10             # 走了 10 回合还没到任务点则换点/放弃
 ACCEPT_MAX_RETRIES = 2        # acceptTask 已发但任务未下发的最大重试次数
 PARSE_FAIL_CORRECT = 3        # 连续解析失败 N 次发修正 prompt
 PARSE_FAIL_EXPLORE = 6        # 连续解析失败 N 次转本地兜底探索
@@ -270,10 +270,10 @@ class EvolveModule:
         if turn.round_in_day > ACCEPT_DEADLINE:
             return False
         if state.phase == "idle":
-            target = self._choose_task_point(turn)
-            if target is None:
+            target_task = self._choose_task_point(turn)
+            if target_task is None:
                 return False
-            state.task_point = (target.x, target.y)
+            state.task_point = (target_task.pos.x, target_task.pos.y)
             state.phase = "walking"
             state.walk_start_round = turn.round_no
             state.accepted_round = 0
@@ -281,6 +281,11 @@ class EvolveModule:
         point = Pos(*state.task_point)  # type: ignore[arg-type]
 
         if distance(pioneer.pos, point) <= 1:
+            # 冷却中的任务点：驻守等待（不发 acceptTask），冷却结束立即接
+            tp = next((t for t in turn.player_tasks if t.pos == point), None)
+            can_accept = tp is None or (tp.is_valid and tp.cooldown_rounds == 0)
+            if not can_accept:
+                return True
             if state.accepted_round == 0:
                 decision.commands[pioneer.unit_id] = cmd_accept_task()
                 state.accepted_round = turn.round_no
@@ -306,21 +311,23 @@ class EvolveModule:
             return True
         return True   # 卡住也保留状态，下回合继续尝试
 
-    def _choose_task_point(self, turn: Turn) -> Pos | None:
+    def _choose_task_point(self, turn: Turn):
+        """选任务点：可接的优先；全在冷却时选最快恢复的（提前驻守等待）。"""
         state = self.memory.evolve
         pioneer = turn.pioneer()
         if pioneer is None:
             return None
-        points = [
-            tp for tp in turn.player_tasks
-            if tp.is_valid and tp.cooldown_rounds == 0 and tp.timeout_rounds > 0
-        ]
+        points = [tp for tp in turn.player_tasks if tp.timeout_rounds > 0]
         if not points:
             return None
-        points.sort(key=lambda tp: (distance(pioneer.pos, tp.pos), tp.pos.x, tp.pos.y))
-        index = state.last_point_index % min(len(points), 2)
+        ready = [tp for tp in points if tp.is_valid and tp.cooldown_rounds == 0]
+        pool = ready or points
+        pool.sort(key=lambda tp: (
+            tp.cooldown_rounds, distance(pioneer.pos, tp.pos), tp.pos.x, tp.pos.y,
+        ))
+        index = state.last_point_index % min(len(pool), 2)
         state.last_point_index += 1
-        return points[index].pos
+        return pool[index]
 
     def _forced_answer(self) -> str:
         state = self.memory.evolve
@@ -407,7 +414,11 @@ class EvolveModule:
         if self._pending_cmd or self._pending_answer:
             return None
         if state.parse_failures >= PARSE_FAIL_EXPLORE:
-            return None              # 已放弃 LLM，走兜底探索
+            # 兜底探索期间每 10 回合重试一次 LLM
+            if turn.round_no - state.llm_retry_round >= 10:
+                state.llm_retry_round = turn.round_no
+                return self._build_prompt(turn)
+            return None
         return self._build_prompt(turn)
 
     def _build_prompt(self, turn: Turn) -> str:
