@@ -106,7 +106,9 @@ class GameMemory:
     tower_plan: dict[tuple[int, int], str] = field(default_factory=dict)
     site_failures: dict[tuple[int, int], int] = field(default_factory=dict)
     ring_completed: bool = False
-    # ^ 围墙圈是否曾合拢过（合拢后缺口只由石头工单修，金属工回归采矿）
+    # ^ 正面半圈是否曾合拢过（合拢后缺口只由石头工单修，金属工回归采矿）
+    wall_phase: str = "front"
+    # ^ "front"=只围面向机器人的半圈；"full"=补齐整圈（有塔升2级或第4天后）
     # ^ 炮台位->武器类型的持久映射（loadout 锚定，防站点列表漂移导致重复建同一武器）
 
     # 指令反馈

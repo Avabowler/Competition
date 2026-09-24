@@ -183,10 +183,9 @@ class Economy:
             if _walk_or_reach(turn, worker, [target], decision, claimed):
                 return
 
-        # 3) 采石 / 修墙物资：攒一小批就回去建（快周转）
-        if stones < STONE_RESERVE or not pending_walls:
-            if self._mine_round(turn, worker, "stone", decision):
-                return
+        # 3) 采石 / 修墙物资（无墙可建或走不过去也采矿，防原地发呆）
+        if self._mine_round(turn, worker, "stone", decision):
+            return
 
         # 4) 围墙已齐且石头富余 -> 去卖掉多余的石头
         self._sell_trip(turn, worker, decision, claimed, keep_ore="stone")
@@ -387,6 +386,26 @@ class Economy:
             return any(w.level == wanted for w in turn.walls())
         return False
 
+    def fallback_move(self, turn: Turn, worker: Unit, decision: Decision,
+                      claimed: set[Pos]) -> None:
+        """空闲工人保底移动：最近矿区 -> 小贩 -> 基地，绝不原地发呆。"""
+        for targets in (turn.mines(), list(turn.vendors())):
+            if not targets:
+                continue
+            target = min(
+                targets, key=lambda p: (distance(worker.pos, p), p.x, p.y),
+            )
+            if distance(worker.pos, target) <= 1:
+                continue          # 已就位（下回合会有具体动作）
+            step = next_step(turn, worker, target)
+            if step is not None and step not in claimed:
+                claimed.add(step)
+                decision.commands[worker.unit_id] = {
+                    "action": "move",
+                    "targetPos": [{"x": step.x, "y": step.y}],
+                }
+                return
+
     # ---- 升级券使用（走到目标建筑旁使用；目标选血量最低的）
 
     def use_vouchers(self, turn: Turn, roles: list[Unit], decision: Decision,
@@ -433,7 +452,7 @@ class Economy:
 
 
 DAY_SELL_DEADLINE = 60     # 白天第 60 回合后金属工人开始收尾贩卖
-GOLD_TRIP_LINE = 120       # 金币闲置到该值就提前跑一趟商店消费
+GOLD_TRIP_LINE = 100       # 金币到该值就跑商店（=首座塔升级券价格，保首日升级）
 RESTOCK_ITEMS = ("WallFixer", "Bomb", "DizzyWeapon", "Medicine")
 HOMEBOUND_ROUND = 60       # 白天该回合起按"能否在封门前到家"决定是否动身
 GATE_CLOSE_ROUND = 69      # 与 brain.GATE_CLOSE_ROUND 保持一致

@@ -152,11 +152,16 @@ def tower_sites(turn: Turn, memory: GameMemory | None = None) -> list[Pos]:
         return candidates[:3]
     return list(best)
 
-def wall_plan(turn: Turn, memory: GameMemory | None = None) -> list[Pos]:
-    """围墙防线：**来袭正面优先**建造，门口开在背面。
+FRONT_FLANK_CELLS = 2        # 半圈方案中南/北排各向正面延伸的格数
 
-    来袭方向由基地在地图的左右半区推断（左半区基地 -> 机器人从左来）。
-    建造顺序：正面排 -> 南 -> 北 -> 背面排（门口在背面排上，最后合拢）。
+
+def wall_plan(turn: Turn, memory: GameMemory | None = None,
+              full: bool = False) -> list[Pos]:
+    """围墙防线（分阶段）：
+    - 前期（full=False）：只围**面向机器人的半圈**（正面排 + 南/北排靠正面
+      两格），石头开销约一半，省下的产能转经济；
+    - 后期（full=True）：补齐南/北剩余与背面排（门口在背面）。
+    来袭方向由基地左右半区推断，正面排始终最优先。
     """
     station = turn.station()
     if station is None:
@@ -164,22 +169,36 @@ def wall_plan(turn: Turn, memory: GameMemory | None = None) -> list[Pos]:
     rows = wall_rows(turn)
     front = attack_side(turn)
     back = entrance_side(turn)
-    order = [*rows[front], *rows["south"], *rows["north"], *rows[back]]
     door = entrance_pos(turn)
     occupied = turn.occupied_cells()
-    planned: list[Pos] = []
-    for pos in order:
+
+    def usable(pos: Pos) -> bool:
         if door is not None and pos == door:
-            continue
-        if not turn.on_map(pos):
-            continue
-        if pos in turn.zones:
-            continue
-        if pos in occupied:
-            continue
+            return False
+        if not turn.on_map(pos) or pos in turn.zones or pos in occupied:
+            return False
         if memory is not None and (pos.x, pos.y) in memory.build_failures:
-            continue
-        planned.append(pos)
+            return False
+        return True
+
+    front_row = [p for p in rows[front] if usable(p)]
+
+    def flank_side(side: str) -> list[Pos]:
+        row = sorted(
+            rows[side],
+            key=lambda p: (-p.x if front == "east" else p.x),
+        )
+        return [p for p in row[:FRONT_FLANK_CELLS] if usable(p)]
+
+    planned = front_row + flank_side("south") + flank_side("north")
+    if full:
+        seen = set(planned)
+        for side in ("south", "north", back):
+            for pos in rows[side]:
+                if pos in seen or not usable(pos):
+                    continue
+                seen.add(pos)
+                planned.append(pos)
     return planned
 
 
@@ -201,7 +220,8 @@ def entrance_pos(turn: Turn) -> Pos | None:
 
 
 def walls_pending(turn: Turn, memory: GameMemory) -> list[Pos]:
-    plan = wall_plan(turn, memory)
+    full = getattr(memory, "wall_phase", "front") == "full"
+    plan = wall_plan(turn, memory, full=full)
     standing = {unit.pos for unit in turn.walls()}
     return [pos for pos in plan if pos not in standing]
 

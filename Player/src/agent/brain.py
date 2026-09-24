@@ -115,12 +115,18 @@ class Brain:
                 turn, worker, job, decision, claimed, build_slots,
             )
 
-        # 围墙圈首次合拢检测（差 2 格内视为合拢，容忍中立格缺口）
+        # 正面半圈合拢检测 -> 锁存（释放金属工去经济线）
         if not self.memory.ring_completed:
-            standing_walls = len(turn.walls())
-            if standing_walls >= len(wall_ring(turn)) - 2:
+            if len(walls_pending(turn, self.memory)) <= 1:
                 self.memory.ring_completed = True
-                LOGGER.info("wall ring completed (%d walls)", standing_walls)
+                LOGGER.info("front wall ring completed")
+
+        # 阶段流转：有塔升到 2 级或第 4 天起，从"半圈"扩为"整圈"
+        if self.memory.wall_phase == "front" and (
+            any(w.level >= 2 for w in turn.weapons()) or turn.day >= 4
+        ):
+            self.memory.wall_phase = "full"
+            LOGGER.info("wall phase -> full")
 
         # 开拓者：任务 > 宝藏 > 升级券 > 待命
         # 闸门：城墙缺口多时不开新任务（防线优先），最迟 40 回合放行
@@ -147,6 +153,10 @@ class Brain:
         ]
         if idle_roles:
             self.economy.use_vouchers(turn, idle_roles, decision, claimed)
+        # 保底：仍无动作的工人走向最近矿区/小贩（防原地发呆）
+        for worker in workers:
+            if worker.unit_id not in decision.commands                     and worker.unit_id not in handled:
+                self.economy.fallback_move(turn, worker, decision, claimed)
 
         # 骚扰：金币富余时买召唤令（使用由 items 完成）
         self._maybe_harass(turn, decision, handled)
@@ -222,6 +232,8 @@ class Brain:
         gate = self.memory.gate
         if not gate.enabled:
             return
+        if self.memory.wall_phase != "full":
+            return              # 半圈阶段没有完整门框，不封门
         gate_pos = entrance_pos(turn)
         if gate_pos is None:
             gate.enabled = False

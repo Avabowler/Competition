@@ -27,6 +27,7 @@ def make_brain_turn(round_no: int):
     turn = Turn.load(payload)
     brain = Brain()
     brain.worker_jobs[10010] = "stone"
+    brain.memory.wall_phase = "full"      # 封门只在整圈阶段启用
     return brain, turn
 
 
@@ -74,6 +75,14 @@ def test_gate_not_closed_when_someone_outside():
         command.get("action") != "build" or command.get("name") != "wall"
         for command in decision.commands.values()
     )
+
+
+def test_gate_not_closed_in_front_phase():
+    brain, turn = make_brain_turn(69)
+    brain.memory.wall_phase = "front"     # 半圈阶段不封门
+    decision = Decision()
+    brain._gate_evening(turn, decision, set(), set())
+    assert decision.commands == {}
 
 
 def test_gate_disabled_after_build_failures():
