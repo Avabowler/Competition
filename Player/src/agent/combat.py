@@ -97,36 +97,76 @@ class Combat:
             self._hide(turn, roles, decision, claimed)
             return
 
-        # 角色-武器配对：按序号稳定绑定，角色数可能多于/少于武器数
-        pairs: list[tuple[Unit, Unit]] = []
-        for index, weapon in enumerate(weapons):
-            if index < len(roles):
-                pairs.append((roles[index], weapon))
-        # 多出来的角色跟随第一个武器附近（备用操控手）
-        for role in roles[len(weapons):]:
-            pairs.append((role, weapons[0]))
+        # 每座武器的可站位格（相邻且可通行），操控配对按距离贪心：
+        # 关键约束是一座武器的可站位格可能只剩 1 个，固定 zip 配对会让
+        # 某座炮台永远无人可控（真实事故：加特林整夜哑火）。
+        stand_cells: dict[int, list[Pos]] = {}
+        for weapon in weapons:
+            blocked = turn.blocked(None)
+            cells = [
+                n for n in weapon.pos.neighbours()
+                if turn.on_map(n) and n not in blocked
+            ]
+            cells.sort(key=lambda p: (p.x, p.y))
+            stand_cells[weapon.unit_id] = cells
 
-        used_roles: set[int] = set()
-        for role, weapon in pairs:
-            if role.unit_id in used_roles:
+        assignments: list[tuple[Unit, Unit, Pos | None]] = []  # (role, weapon, stand)
+        used_weapons: set[int] = set()
+        used_stands: set[Pos] = set()
+        unassigned: list[Unit] = []
+        for role in roles:
+            best: tuple[int, int, Unit, Pos | None] | None = None
+            for w_index, weapon in enumerate(weapons):
+                if weapon.unit_id in used_weapons:
+                    continue
+                here = distance(role.pos, weapon.pos) <= 1
+                candidates: list[Pos] = []
+                if here:
+                    candidates = [role.pos]
+                else:
+                    candidates = [
+                        c for c in stand_cells[weapon.unit_id]
+                        if c not in used_stands and c not in claimed
+                    ]
+                if not candidates:
+                    continue
+                stand = min(candidates, key=lambda p: (distance(role.pos, p), p.x, p.y))
+                cost = (distance(role.pos, stand), w_index)
+                if best is None or cost < best[:2]:
+                    best = (cost[0], cost[1], weapon, stand)
+            if best is None:
+                unassigned.append(role)
                 continue
+            _, _, weapon, stand = best
+            used_weapons.add(weapon.unit_id)
+            used_stands.add(stand)
+            assignments.append((role, weapon, stand))
+
+        # 多余角色跟随第一座武器（备用操控手，不重复开火）
+        for role in unassigned:
+            assignments.append((role, weapons[0], None))
+
+        fired_weapons: set[int] = set()
+        for role, weapon, stand in assignments:
             if distance(role.pos, weapon.pos) <= 1:
-                used_roles.add(role.unit_id)
-                if weapon.cooldown > 0:
-                    continue          # 火箭冷却中
+                if weapon.unit_id in fired_weapons or weapon.cooldown > 0:
+                    continue
                 targets = self._targets_for(turn, weapon, station_pos)
                 if targets:
+                    fired_weapons.add(weapon.unit_id)
                     decision.commands[weapon.unit_id] = cmd_attack(
                         role.unit_id, targets,
                     )
-            else:
-                used_roles.add(role.unit_id)
+                continue
+            goal = stand if stand is not None else weapon.pos
+            step = next_step(turn, role, goal)
+            if step is None:
                 step = next_step(turn, role, weapon.pos)
-                if step is not None and step not in claimed:
-                    claimed.add(step)
-                    decision.commands[role.unit_id] = {
-                        "action": "move", "targetPos": [{"x": step.x, "y": step.y}],
-                    }
+            if step is not None and step not in claimed:
+                claimed.add(step)
+                decision.commands[role.unit_id] = {
+                    "action": "move", "targetPos": [{"x": step.x, "y": step.y}],
+                }
 
     # ---- 各武器目标选择
 

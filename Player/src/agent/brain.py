@@ -1,24 +1,28 @@
 """总调度：昼夜流程编排、开拓者优先级、prompt 槽仲裁。
 
 优先级约定：
+- 物品动作（items）抢占一切 duty：应急炸弹/眩晕 > 药剂 > 召唤令 > 修墙；
 - 开拓者白天：自进化任务 > 宝藏 > 升级券使用/待命；
-- 开拓者夜晚：解题中驻守任务点（危险则弃守），否则参战；
+- 关门战术：黄昏 64 回合起归位，69-70 石头工封门；清晨 1-5 拆门出门；
 - prompt 槽每回合仅一个：evolve（任务期免费）> news > treasure，受每日 3 次预算约束。
 """
 import logging
 from typing import Any
 
-from .build import tower_sites, walls_pending
+from .build import entrance_pos, tower_sites, walls_pending
 from .combat import Combat
 from .economy import Economy
 from .grid import next_step
+from .items import ItemService
 from .memory import GameMemory
 from .protocol import (
     Decision,
     Pos,
     Turn,
-    cmd_buy,
+    cmd_build,
+    cmd_remove,
     distance,
+    station_footprint,
 )
 from .tasks.evolve import EvolveModule
 from .tasks.news import NewsModule
@@ -27,8 +31,10 @@ from .validator import sanitize
 
 LOGGER = logging.getLogger(__name__)
 
-HARASS_GOLD_LINE = 400        # 金币超过该线购买召唤令骚扰对方
-DUSK_REGROUP_ROUND = 66       # 白天该回合起角色归位到夜间武器旁
+HARASS_GOLD_LINE = 600        # 金币富余线（防御优先，之后才骚扰）
+DUSK_REGROUP_ROUND = 64       # 白天该回合起角色归位到夜间武器旁
+GATE_CLOSE_ROUND = 69         # 封门时间窗（69-70）
+GATE_OPEN_DEADLINE = 5        # 清晨拆门时间窗（1-5）
 
 
 class Brain:
@@ -36,6 +42,7 @@ class Brain:
         self.memory = GameMemory()
         self.economy = Economy(self.memory)
         self.combat = Combat()
+        self.items = ItemService(self.memory)
         self.evolve = EvolveModule(self.memory)
         self.news = NewsModule(self.memory)
         self.treasure = TreasureModule(self.memory)
@@ -77,26 +84,30 @@ class Brain:
 
     def _day(self, turn: Turn, decision: Decision) -> None:
         claimed: set[Pos] = set()
+        # 物品动作抢占一切 duty
+        handled = self.items.plan(turn, decision, claimed)
         workers = turn.workers()
         self._assign_worker_jobs(turn)
 
-        # 黄昏归位：白天最后几回合全员走向夜间操控位，避免入夜长跑
+        # 黄昏：归位 + 封门
         if turn.round_in_day >= DUSK_REGROUP_ROUND:
-            self._dusk_regroup(turn, decision, claimed)
+            self._gate_evening(turn, decision, claimed, handled)
+            self._dusk_regroup(turn, decision, claimed, handled)
             return
+
+        # 清晨：先拆门再干活
+        if turn.round_in_day <= GATE_OPEN_DEADLINE:
+            self._gate_morning(turn, decision, claimed, handled)
 
         all_sites = tower_sites(turn, self.memory)
         standing_towers = {u.pos for u in turn.weapons()}
-        loadouts = ("gatling", "railgun", "rocket")
-        tower_slots = [
-            (site, loadouts[index])
-            for index, site in enumerate(all_sites)
-            if site not in standing_towers
-        ]
+        tower_slots = self._tower_slots(turn, all_sites, standing_towers)
         wall_slots = [(pos, "wall") for pos in walls_pending(turn, self.memory)]
         build_slots = tower_slots + wall_slots
 
         for worker in workers:
+            if worker.unit_id in handled:
+                continue
             job = self.worker_jobs.get(worker.unit_id, "metal")
             self.economy.plan_worker(
                 turn, worker, job, decision, claimed, build_slots,
@@ -104,7 +115,8 @@ class Brain:
 
         # 开拓者：任务 > 宝藏 > 升级券 > 待命
         pioneer = turn.pioneer()
-        if pioneer is not None and pioneer.unit_id not in decision.commands:
+        if pioneer is not None and pioneer.unit_id not in handled \
+                and pioneer.unit_id not in decision.commands:
             used = self.evolve.plan(turn, decision, claimed)
             if not used and pioneer.unit_id not in decision.commands:
                 used = self.treasure.plan(turn, decision, claimed)
@@ -113,21 +125,167 @@ class Brain:
 
         # 工人空闲时把身上的升级券用掉
         idle_roles = [
-            w for w in workers if w.unit_id not in decision.commands
+            w for w in workers
+            if w.unit_id not in decision.commands and w.unit_id not in handled
         ]
         if idle_roles:
             self.economy.use_vouchers(turn, idle_roles, decision, claimed)
 
-        # 骚扰：金币富余时让最近商店的人捎召唤令（在购物清单里体现）
-        self._maybe_harass(turn, decision)
+        # 骚扰：金币富余时买召唤令（使用由 items 完成）
+        self._maybe_harass(turn, decision, handled)
 
-    def _dusk_regroup(self, turn: Turn, decision: Decision, claimed: set[Pos]) -> None:
-        """白天最后 5 回合：角色提前走到各自夜间武器旁。"""
+    def _tower_slots(self, turn: Turn, all_sites: list[Pos],
+                     standing: set[Pos]) -> list[tuple[Pos, str]]:
+        """站点->武器的持久映射：首次规划时按序分配 gatling/railgun/rocket，
+        之后每个格子永久持有自己的 loadout（站点列表因失败/占位漂移也不串型）。
+        站点建造连续失败 >=2 次则释放其 loadout 给新站点复用。"""
+        plan = self.memory.tower_plan
+        site_failures = self.memory.site_failures
+        valid = {(s.x, s.y) for s in all_sites}
+        # 站点已从候选中消失（被拉黑）或连续失败 -> 释放映射
+        for key in list(plan):
+            if key not in valid or site_failures.get(key, 0) >= 2:
+                del plan[key]
+        # 记录炮台建造失败次数
+        for command in self.memory.failed_actions.values():
+            if command.get("action") != "build":
+                continue
+            name = command.get("name")
+            targets = command.get("targetPos") or []
+            if name in ("gatling", "railgun", "rocket") and targets:
+                key = (targets[0]["x"], targets[0]["y"])
+                site_failures[key] = site_failures.get(key, 0) + 1
+        if not plan:
+            for site, loadout in zip(all_sites, ("gatling", "railgun", "rocket")):
+                plan[(site.x, site.y)] = loadout
+        used = set(plan.values())
+        for site in all_sites:
+            key = (site.x, site.y)
+            if key not in plan:
+                leftover = [lo for lo in ("gatling", "railgun", "rocket") if lo not in used]
+                plan[key] = leftover[0] if leftover else "gatling"
+                used.add(plan[key])
+        return [
+            (site, plan[(site.x, site.y)])
+            for site in all_sites
+            if site not in standing
+        ]
+
+    def _assign_worker_jobs(self, turn: Turn) -> None:
+        workers = turn.workers()
+        if not workers:
+            return
+        # 关门战术启用时石头工必须常备石头（每天 1 块封门）
+        stone_needed = bool(walls_pending(turn, self.memory)) or bool(
+            tower_sites(turn, self.memory)
+        ) or self.memory.gate.enabled
+        for worker in workers:
+            job = self.worker_jobs.get(worker.unit_id)
+            if job is None:
+                job = "stone" if stone_needed and len(
+                    [j for j in self.worker_jobs.values() if j == "stone"]
+                ) == 0 else "metal"
+                self.worker_jobs[worker.unit_id] = job
+        # 防线完工且关门不可用时石头工才转金属
+        if not stone_needed:
+            for worker in workers:
+                self.worker_jobs[worker.unit_id] = "metal"
+
+    # ---------------------------------------------------------------- 关门战术
+
+    def _gate_evening(self, turn: Turn, decision: Decision, claimed: set[Pos],
+                      handled: set[int]) -> None:
+        """黄昏 69-70 回合：石头工在门口建墙封门。"""
+        gate = self.memory.gate
+        if not gate.enabled:
+            return
+        gate_pos = entrance_pos(turn)
+        if gate_pos is None:
+            gate.enabled = False
+            return
+        gate.pos = (gate_pos.x, gate_pos.y)
+        # 上回合封门建造失败 -> 记录失败，连续 2 次禁用战术
+        for command in self.memory.failed_actions.values():
+            if command.get("action") != "build":
+                continue
+            targets = command.get("targetPos") or []
+            if targets and (targets[0]["x"], targets[0]["y"]) == gate.pos:
+                gate.record_build_failure()
+                if not gate.enabled:
+                    LOGGER.info("gate tactic disabled after build failures")
+                    return
+
+        standing = {u.pos for u in turn.walls()}
+        if gate_pos in standing:
+            return
+        # 人齐才关门：有角色还在门外时宁可不关（锁死自己 = 全防线瘫痪）
+        fp = station_footprint(turn.station().pos) if turn.station() else ()
+        for role in turn.controllables():
+            if fp and min(distance(role.pos, cell) for cell in fp) > 3:
+                return
+        builder = self._stone_worker(turn)
+        if builder is None or builder.unit_id in handled:
+            return
+        stones = builder.backpack.count("stone")
+        if stones < 1:
+            return
+        if distance(builder.pos, gate_pos) == 1:
+            decision.commands[builder.unit_id] = cmd_build("wall", gate_pos)
+        elif distance(builder.pos, gate_pos) > 1:
+            # 站位目标：门口的"邻格"而非门洞本身（站进门洞会被围墙圈封死）
+            blocked = turn.blocked(builder)
+            stand_cells = [
+                n for n in gate_pos.neighbours()
+                if turn.on_map(n) and n not in blocked and n != builder.pos
+            ]
+            if not stand_cells:
+                return
+            stand = min(stand_cells, key=lambda p: (distance(builder.pos, p), p.x, p.y))
+            step = next_step(turn, builder, stand)
+            if step is not None and step not in claimed:
+                claimed.add(step)
+                decision.commands[builder.unit_id] = {
+                    "action": "move", "targetPos": [{"x": step.x, "y": step.y}],
+                }
+
+    def _gate_morning(self, turn: Turn, decision: Decision, claimed: set[Pos],
+                      handled: set[int]) -> None:
+        """清晨 1-5 回合：石头工拆掉门口的墙出门。"""
+        gate = self.memory.gate
+        if not gate.enabled or gate.pos is None:
+            return
+        gate_pos = Pos(*gate.pos)
+        gate_wall = next((w for w in turn.walls() if w.pos == gate_pos), None)
+        if gate_wall is None:
+            return               # 夜里被打掉/已拆，无需处理
+        builder = self._stone_worker(turn)
+        if builder is None or builder.unit_id in handled:
+            return
+        if distance(builder.pos, gate_pos) <= 1:
+            decision.commands[builder.unit_id] = cmd_remove(gate_pos)
+        else:
+            step = next_step(turn, builder, gate_pos)
+            if step is not None and step not in claimed:
+                claimed.add(step)
+                decision.commands[builder.unit_id] = {
+                    "action": "move", "targetPos": [{"x": step.x, "y": step.y}],
+                }
+
+    def _stone_worker(self, turn: Turn) -> Any:
+        for worker in turn.workers():
+            if self.worker_jobs.get(worker.unit_id) == "stone":
+                return worker
+        return turn.workers()[0] if turn.workers() else None
+
+    def _dusk_regroup(self, turn: Turn, decision: Decision, claimed: set[Pos],
+                      handled: set[int] | None = None) -> None:
+        """黄昏：角色提前走到各自夜间武器旁。"""
+        handled = handled or set()
         weapons = turn.weapons()
         roles = turn.controllables()
         pairs = list(zip(roles, list(weapons) + [None] * max(0, len(roles) - len(weapons))))
         for role, weapon in pairs:
-            if role.unit_id in decision.commands:
+            if role.unit_id in handled or role.unit_id in decision.commands:
                 continue
             goal = weapon.pos if weapon is not None else None
             if goal is not None and distance(role.pos, goal) <= 1:
@@ -142,27 +300,10 @@ class Brain:
                     "action": "move", "targetPos": [{"x": step.x, "y": step.y}],
                 }
 
-    def _assign_worker_jobs(self, turn: Turn) -> None:
-        workers = turn.workers()
-        if not workers:
-            return
-        stone_needed = bool(walls_pending(turn, self.memory)) or bool(
-            tower_sites(turn, self.memory)
-        )
-        for worker in workers:
-            job = self.worker_jobs.get(worker.unit_id)
-            if job is None:
-                job = "stone" if stone_needed and len(
-                    [j for j in self.worker_jobs.values() if j == "stone"]
-                ) == 0 else "metal"
-                self.worker_jobs[worker.unit_id] = job
-        # 防线完工后石头工转金属
-        if not stone_needed:
-            for worker in workers:
-                self.worker_jobs[worker.unit_id] = "metal"
-
-    def _maybe_harass(self, turn: Turn, decision: Decision) -> None:
-        """金币富余时购买机器人召唤令，给对方夜晚加压（对方少赚生存/击杀分）。"""
+    def _maybe_harass(self, turn: Turn, decision: Decision,
+                      handled: set[int] | None = None) -> None:
+        """金币富余时购买机器人召唤令，给对方夜晚加压（使用由 items 完成）。"""
+        handled = handled or set()
         if turn.gold < HARASS_GOLD_LINE:
             return
         order = turn.weapon_shop.get("BossRobotSummonOrder", 200)
@@ -170,7 +311,7 @@ class Brain:
             order = turn.weapon_shop.get("LargeRobotSummonOrder", 100)
         buyer = None
         for role in (*turn.workers(), turn.pioneer() or None):
-            if role is None:
+            if role is None or role.unit_id in handled:
                 continue
             shops = list(turn.weapon_shops())
             if shops and distance(role.pos, min(
@@ -189,16 +330,19 @@ class Brain:
         state = self.memory.evolve
         pioneer = turn.pioneer()
 
+        # 物品动作抢占（应急炸弹/药剂/召唤令）
+        handled = self.items.plan(turn, decision, claimed)
+
         # 解题中的开拓者继续驻守任务点（危险撤离由 evolve 内部处理）
-        pioneer_busy = False
-        if pioneer is not None and state.phase == "solving":
+        if pioneer is not None and state.phase == "solving" \
+                and pioneer.unit_id not in handled:
             pioneer_busy = self.evolve.plan(turn, decision, claimed)
             if pioneer_busy and pioneer.unit_id in decision.commands:
-                # 任务优先：combat 只调度其余角色
-                self.combat.plan_night(turn, decision, claimed, exclude={pioneer.unit_id})
+                self.combat.plan_night(turn, decision, claimed,
+                                       exclude=handled | {pioneer.unit_id})
                 return
 
-        self.combat.plan_night(turn, decision, claimed)
+        self.combat.plan_night(turn, decision, claimed, exclude=handled)
 
     # ---------------------------------------------------------------- LLM 仲裁
 

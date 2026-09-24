@@ -19,34 +19,106 @@ def footprint_distance(pos: Pos, footprint: tuple[Pos, ...]) -> int:
     return min(distance(pos, cell) for cell in footprint)
 
 
-def tower_sites(turn: Turn, memory: GameMemory | None = None) -> list[Pos]:
-    """基地周围一格的炮台位（固定锚点：不管是否已建成，列表保持稳定）。
+def wall_ring(turn: Turn) -> frozenset[Pos]:
+    """围墙圈静态几何（不含门口、不含中立/出界格），供建造与选址共用。"""
+    station = turn.station()
+    if station is None:
+        return frozenset()
+    footprint = station_footprint(station.pos)
+    xs = [p.x for p in footprint]
+    ys = [p.y for p in footprint]
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    entrance = Pos(xmax + 2, ymin - 2)
+    cells: set[Pos] = set()
+    for x in range(xmin - 2, xmax + 3):
+        for y in range(ymin - 2, ymax + 3):
+            pos = Pos(x, y)
+            ring = footprint_distance(pos, footprint)
+            if ring != 2 or pos == entrance or not turn.on_map(pos):
+                continue
+            if pos in turn.zones:
+                continue
+            cells.add(pos)
+    return frozenset(cells)
 
-    稳定性很重要：炮台 loadout(gatling/railgun/rocket) 按本列表索引分配，
-    若已建成的炮台把格子挤出去，会导致后续建造搭配错位。
+
+def tower_sites(turn: Turn, memory: GameMemory | None = None) -> list[Pos]:
+    """基地周围一格的炮台位（固定锚点）。
+
+    选址准则（连通性优先）：三座塔的"可站位格"必须从门口经内部走廊全部可达，
+    否则会出现第三座炮台永远无人可控的结构性死位。在所有 3-组合里选
+    (连通可行, 可站位格最多, 打散度大) 的最优解；几何静态，结果稳定。
     """
+    from itertools import combinations
+
     station = turn.station()
     if station is None:
         return []
     footprint = station_footprint(station.pos)
-    candidates = [
+    ring2 = wall_ring(turn)
+    candidates = sorted({
         n for cell in footprint for n in cell.neighbours()
         if turn.on_map(n)
         and footprint_distance(n, footprint) == 1
         and n not in turn.zones
-    ]
-    seen: set[Pos] = set()
-    unique: list[Pos] = []
-    for pos in sorted(candidates, key=lambda p: (p.x, p.y)):
-        if pos in seen:
-            continue
-        seen.add(pos)
-        if memory is not None and (pos.x, pos.y) in memory.build_failures:
-            continue
-        unique.append(pos)
-    unique.sort(key=lambda p: (footprint_distance(p, footprint), p.x, p.y))
-    return unique[:3]
+        and n not in ring2
+    }, key=lambda p: (p.x, p.y))
+    if memory is not None:
+        candidates = [
+            p for p in candidates if (p.x, p.y) not in memory.build_failures
+        ]
+    if len(candidates) < 3:
+        return candidates
 
+    door = Pos(max(p.x for p in footprint) + 2, min(p.y for p in footprint) - 2)
+    door_adjacent = {
+        n for n in door.neighbours()
+        if footprint_distance(n, footprint) == 1 and n in candidates
+    }
+
+    def evaluate(combo: tuple[Pos, ...]) -> tuple[int, int, int] | None:
+        blocked = set(footprint) | set(combo) | set(ring2) | set(turn.zones)
+        free = {
+            p for p in candidates
+            if p not in combo and p not in blocked
+        }
+        starts = door_adjacent & free
+        visited: set[Pos] = set(starts)
+        frontier = list(starts)
+        while frontier:
+            cur = frontier.pop()
+            for n in cur.neighbours():
+                if n in free and n not in visited:
+                    visited.add(n)
+                    frontier.append(n)
+        stands: set[Pos] = set()
+        reachable_stands = 0
+        for site in combo:
+            mine = {n for n in site.neighbours() if n in free}
+            stands |= mine
+            if mine & visited:
+                reachable_stands += 1
+        connected = int(len(stands) == len(stands & visited) and reachable_stands == 3
+                        and bool(starts))
+        spread = min(
+            (distance(a, b) for a, b in combinations(combo, 2)), default=0,
+        )
+        return (connected, reachable_stands, len(stands), spread)
+
+    best: tuple[Pos, ...] | None = None
+    best_score: tuple[int, int, int, int] | None = None
+    for combo in combinations(candidates, 3):
+        score = evaluate(combo)
+        if score is None:
+            continue
+        full = (score[0], score[1], score[2], score[3])
+        if best_score is None or full > best_score:
+            best_score = full
+            best = combo
+    if best is None:
+        return candidates[:3]
+    return list(best)
 
 def wall_plan(turn: Turn, memory: GameMemory | None = None) -> list[Pos]:
     """基地外圈两格的围墙防线，顺时针列出，留一个门口。"""
@@ -81,6 +153,17 @@ def wall_plan(turn: Turn, memory: GameMemory | None = None) -> list[Pos]:
             continue
         planned.append(pos)
     return planned
+
+
+def entrance_pos(turn: Turn) -> Pos | None:
+    """围墙圈的门口位置（与 wall_plan 排除的是同一格），关门战术目标点。"""
+    station = turn.station()
+    if station is None:
+        return None
+    footprint = station_footprint(station.pos)
+    xs = [p.x for p in footprint]
+    ys = [p.y for p in footprint]
+    return Pos(max(xs) + 2, min(ys) - 2)
 
 
 def walls_pending(turn: Turn, memory: GameMemory) -> list[Pos]:

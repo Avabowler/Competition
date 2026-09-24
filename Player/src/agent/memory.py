@@ -45,6 +45,13 @@ class EvolveTaskState:
     llm_history: list[tuple[str, str]] = field(default_factory=list)  # (prompt, resp)
     last_answer: str = ""
     best_answer: str = ""
+    full_task_text: str = ""             # 当前任务原文（SOP 全文比对用）
+    accept_retries: int = 0              # acceptTask 已发但未下发任务的连续次数
+    parse_failures: int = 0              # llmResp 连续解析失败次数
+    corrected_prompt_sent: bool = False  # 是否已发过"严格 JSON"修正 prompt
+    explore_index: int = 0               # 解析彻底失败时的兜底探索命令游标
+    sop_hint_used: bool = False          # 本任务是否命中 SOP（提示模式）
+    sop_hint_injected: bool = False      # SOP 提示是否已注入过 prompt
     submit_attempts: int = 0
     last_point_index: int = 0
 
@@ -56,7 +63,21 @@ class SopRecord:
     task_type: str
     answer: str = ""
     commands: list[str] = field(default_factory=list)
+    full_text: str = ""                  # 完整任务原文（防过期答案：全文一致才直接复用）
     notes: str = ""
+
+
+@dataclass(slots=True)
+class GateState:
+    """关门战术状态：黄昏在基地围墙圈门口建墙，清晨拆除。"""
+    pos: tuple[int, int] | None = None
+    fail_count: int = 0                  # 连续建造失败次数
+    enabled: bool = True                 # 连续失败>=2 自动禁用（回退留门）
+
+    def record_build_failure(self) -> None:
+        self.fail_count += 1
+        if self.fail_count >= 2:
+            self.enabled = False
 
 
 @dataclass(slots=True)
@@ -80,6 +101,11 @@ class GameMemory:
     evolve: EvolveTaskState = field(default_factory=EvolveTaskState)
     treasure: TreasureState = field(default_factory=TreasureState)
     sop_library: list[SopRecord] = field(default_factory=list)
+    gate: GateState = field(default_factory=GateState)
+    last_emergency_round: int = -999       # 上次应急道具使用回合（冷却用）
+    tower_plan: dict[tuple[int, int], str] = field(default_factory=dict)
+    site_failures: dict[tuple[int, int], int] = field(default_factory=dict)
+    # ^ 炮台位->武器类型的持久映射（loadout 锚定，防站点列表漂移导致重复建同一武器）
 
     # 指令反馈
     last_commands: dict[int, dict[str, Any]] = field(default_factory=dict)

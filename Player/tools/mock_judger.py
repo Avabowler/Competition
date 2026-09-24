@@ -55,9 +55,11 @@ BASE_PRICES = {"stone": 1, "iron": 3, "copper": 5}
 # 脚本化 LLM：任务/宝藏的"标准答案"
 MOCK_TASKS = [
     {"type": "自进化类1", "text": "计算 123+456 的值，提交答案字符串。",
-     "answer": "579", "timeout": 40, "score": 50, "gold": 30},
+     "answer": "579", "timeout": 40, "score": 50, "gold": 30,
+     "cmd": 'python3 -c "print(123+456)"'},
     {"type": "自进化类2", "text": "沙盒中存在文件 /tmp/data.txt，输出其行数。提交行数字符串。",
-     "answer": "12", "timeout": 60, "score": 50, "gold": 30},
+     "answer": "12", "timeout": 60, "score": 50, "gold": 30,
+     "cmd": "wc -l < /tmp/data.txt"},
 ]
 MOCK_TREASURE = {
     "pos": (20, 25), "items": ["StarSand", "FrostPotion"],
@@ -221,13 +223,16 @@ def line_cells(start, end) -> list[tuple[int, int]]:
 
 
 class MockJudger:
-    def __init__(self, brain_a, brain_b, seed: int = 42, verbose: bool = False):
+    def __init__(self, brain_a, brain_b, seed: int = 42, verbose: bool = False,
+                 hard: bool = False, llm_prose: bool = False):
         self.world = World(seed)
         self.world.sides = [
             Side("challenger", brain_a, (10, 24)),
             Side("defender", brain_b, (30, 10)),
         ]
         self.verbose = verbose
+        self.hard = hard
+        self.llm_prose = llm_prose
         self.total_rounds = 10 * ROUNDS_PER_DAY
 
     # ------------------------------------------------ 回合主循环
@@ -298,11 +303,12 @@ class MockJudger:
             side = next(s for s in world.sides if s.team == target_team)
             if side.station.health <= 0:
                 continue
+            mult = 2 if self.hard else 1
             waves = [
-                ("smallRobot", 2 + day),
-                ("middleRobot", max(0, day - 1)),
-                ("largeRobot", max(0, day - 3)),
-                ("bossRobot", 1 if day >= 7 else 0),
+                ("smallRobot", (2 + day) * mult),
+                ("middleRobot", max(0, day - 1) * mult),
+                ("largeRobot", max(0, day - 3) * mult),
+                ("bossRobot", (1 if day >= 7 else 0) * mult),
             ]
             for kind, count in waves:
                 for _ in range(count):
@@ -315,6 +321,12 @@ class MockJudger:
                         ROBOT_STATS[kind][2], target_team,
                     ))
                     world.robot_seq += 1
+            for team, kind in list(getattr(world, "pending_summons", [])):
+                spawn = (corner[0], corner[1])
+                world.robots.append(MockRobot(
+                    world.robot_seq, spawn, kind, ROBOT_STATS[kind][2], team))
+                world.robot_seq += 1
+            world.pending_summons = []
 
     # ------------------------------------------------ 请求构建
 
@@ -433,8 +445,11 @@ class MockJudger:
         # LLM/沙盒脚本化响应
         if prompt:
             if side.phase_task:
-                side.llm_resp_queue.append(json.dumps(
-                    {"taskAnswer": self._mock_task_answer(side)}))
+                if self.llm_prose and "严格只输出" not in prompt:
+                    side.llm_resp_queue.append(self._prose_task_response(side, prompt))
+                else:
+                    side.llm_resp_queue.append(json.dumps(
+                        {"taskAnswer": self._mock_task_answer(side)}))
             elif "民间传闻" in prompt or "祭坛" in prompt or "宝藏" in prompt:
                 side.llm_resp_queue.append(json.dumps({
                     "pos": {"x": MOCK_TREASURE["pos"][0], "y": MOCK_TREASURE["pos"][1]},
@@ -499,6 +514,32 @@ class MockJudger:
                 unit.cooldown -= 1
 
         side.last_action_results = results
+
+    def _fake_shell(self, cmd: str) -> str:
+        """迷你假 shell：覆盖 ls/cat/wc/python3 -c 的模式化输出。"""
+        low = cmd.lower()
+        if "wc -l" in low:
+            return "[exitCode:0]\n12 /tmp/data.txt"
+        if "123+456" in cmd.replace(" ", ""):
+            return "[exitCode:0]\n579"
+        if low.startswith("ls") or " ls " in low:
+            return "[exitCode:0]\nREADME.md\ndata.txt\napp.py"
+        if "cat" in low:
+            return "[exitCode:0]\nmock file content line1\nline2"
+        if "python3 -c" in low or "python -c" in low:
+            return "[exitCode:0]\n42"
+        return "[exitCode:0]\n(ok) " + cmd[:40]
+
+    def _prose_task_response(self, side: Side, prompt: str) -> str:
+        """prose 模式：模拟不守格式约定的 LLM（围栏命令/自然语言答案）。"""
+        task = side.task_state.get("task")
+        if task is None:
+            return "我不知道该做什么。"
+        if "尚未执行任何命令" in prompt:
+            return ("好的，我先探索一下沙盒。\n"
+                    "```bash\n" + task["cmd"] + "\n```\n"
+                    "执行后再看结果。")
+        return f"根据命令输出，本题最终答案: {task['answer']}"
 
     def _mock_task_answer(self, side: Side) -> str:
         task = side.task_state.get("task")
@@ -942,13 +983,17 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--swap", action="store_true", help="双方换边再打一场")
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--hard", action="store_true", help="机器人波次x2")
+    parser.add_argument("--llm-prose", action="store_true",
+                        help="mock LLM 用散文+围栏格式回复（验证解析兼容）")
     args = parser.parse_args()
 
     from agent.brain import Brain
     from agent.brain_baseline import BaselineBrain
 
     def play(brain_a, brain_b, seed):
-        judger = MockJudger(brain_a(), brain_b(), seed=seed, verbose=args.verbose)
+        judger = MockJudger(brain_a(), brain_b(), seed=seed, verbose=args.verbose,
+                            hard=args.hard, llm_prose=args.llm_prose)
         return judger.run(max_days=args.days)
 
     report1 = play(Brain, BaselineBrain, args.seed)

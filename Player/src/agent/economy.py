@@ -10,6 +10,7 @@ import logging
 
 from .build import towers_pending, walls_pending
 from .grid import next_step
+from .items import building_max_health
 from .memory import GameMemory
 from .protocol import (
     Decision,
@@ -111,10 +112,25 @@ class Economy:
         # 携带升级券的人最优先送券到目标建筑并使用（否则券会一直压在背包里）
         if self._deliver_vouchers(turn, worker, decision, claimed):
             return
+        # 关门前的回家 deadline：时间不够走回去就立刻动身（关门战术的保命前提）
+        station = turn.station()
+        if station is not None and turn.round_in_day >= HOMEBOUND_ROUND:
+            from .build import footprint_distance
+            from .protocol import station_footprint
+            home_gap = footprint_distance(worker.pos, station_footprint(station.pos))
+            if turn.round_in_day + home_gap >= GATE_CLOSE_ROUND:
+                step = next_step(turn, worker, station.pos)
+                if step is not None and step not in claimed:
+                    claimed.add(step)
+                    decision.commands[worker.unit_id] = {
+                        "action": "move",
+                        "targetPos": [{"x": step.x, "y": step.y}],
+                    }
+                    return
         if role == "stone":
             self._stone_worker(turn, worker, decision, claimed, build_slots)
         else:
-            self._metal_worker(turn, worker, decision, claimed)
+            self._metal_worker(turn, worker, decision, claimed, build_slots)
 
     def _deliver_vouchers(self, turn: Turn, worker: Unit, decision: Decision,
                           claimed: set[Pos]) -> bool:
@@ -178,10 +194,19 @@ class Economy:
     # ---- 金属工人：高价矿 -> 满载贩卖 -> 购物
 
     def _metal_worker(self, turn: Turn, worker: Unit, decision: Decision,
-                      claimed: set[Pos]) -> None:
+                      claimed: set[Pos],
+                      build_slots: list[tuple[Pos, str]] | None = None) -> None:
         memory = self.memory
         ores = [o for o in ("copper", "iron", "stone") if worker.backpack.count(o)]
         load = sum(worker.backpack.count(o) for o in ("copper", "iron", "stone"))
+
+        # 防线缺口大时帮忙建墙（机器人会从缺口直灌基地）
+        walls_pending = [slot for slot in build_slots if slot[1] == "wall"]
+        if len(walls_pending) >= 4 and worker.backpack.count("stone") > 0:
+            for site, name in walls_pending:
+                if distance(worker.pos, site) <= 1:
+                    decision.commands[worker.unit_id] = cmd_build(name, site)
+                    return
 
         # 背包将满 / 当天临近结束 / 金币闲置需要消费 -> 贩卖+购物之旅
         day_ending = turn.round_in_day >= DAY_SELL_DEADLINE
@@ -261,59 +286,108 @@ class Economy:
                     return True
         return False
 
-    # ---- 购物清单（优先级从高到低）
+    # ---- 购物清单（有序：取第一项买得起的）
 
     def _next_purchase(self, turn: Turn, buyer: Unit) -> tuple[str, int] | None:
         gold = turn.gold
         shop = turn.weapon_shop
         weapons = turn.weapons()
-        # 全队已在背包中的券，避免重复购买
-        holding: set[str] = set()
-        for unit in turn.ours:
-            holding.update(item for item in unit.backpack if "Voucher" in item)
-
-        # 1) 药品常备（便宜保命）
-        medicine_count = sum(
-            unit.backpack.count("Medicine") for unit in turn.ours
-            if unit.is_character
-        )
-        weakest = min(
-            (u.health for u in turn.ours if u.is_character), default=999,
-        )
-        if weakest < 120 and medicine_count < MEDICINE_KEEP:
-            if gold >= shop.get("Medicine", 10):
-                return ("Medicine", 1)
-
-        # 2) 武器升级券：优先升加特林/火箭
-        for voucher, target_level in (
-            ("WeaponUpgradeVoucher1", 2), ("WeaponUpgradeVoucher2", 3),
-        ):
-            price = shop.get(voucher, 0)
-            if gold < price or price == 0 or voucher in holding:
-                continue
-            if any(weapon.level == target_level - 1 for weapon in weapons):
-                return (voucher, 1)
-
-        # 3) 基地升级券
         station = turn.station()
-        if station is not None:
-            for voucher, target_level in (
-                ("StationUpgradeVoucher1", 2), ("StationUpgradeVoucher2", 3),
-            ):
-                price = shop.get(voucher, 0)
-                if price and gold >= price and station.level == target_level - 1                         and voucher not in holding:
+        # 全队已在背包中的券/消耗品，避免重复购买
+        holding: set[str] = set()
+        team_count: dict[str, int] = {}
+        for unit in turn.ours:
+            for item in unit.backpack:
+                if "Voucher" in item or item in RESTOCK_ITEMS:
+                    holding.add(item)
+                team_count[item] = team_count.get(item, 0) + 1
+
+        reserve = WEAPON_BUILD_COST     # 保底重建储备：买完不能低于 25
+        def can(price: int, soft: bool = False) -> bool:
+            if price <= 0 or gold < price:
+                return False
+            return soft or gold - price >= reserve
+
+        # 1) 残墙修复包 + 应急道具补货 + 药剂
+        if team_count.get("Medicine", 0) < MEDICINE_KEEP and any(
+            u.is_character and u.health < 120 for u in turn.ours
+        ):
+            if can(shop.get("Medicine", 10), soft=True):
+                return ("Medicine", 1)
+        damaged_wall = any(
+            w.health < building_max_health(w) * 0.6 for w in turn.walls()
+        )
+        if damaged_wall and gold >= 150 and team_count.get("WallFixer", 0) < 2:
+            if can(shop.get("WallFixer", 10), soft=True):
+                return ("WallFixer", 1)
+        if gold >= 500:
+            for item in ("Bomb", "DizzyWeapon"):
+                if team_count.get(item, 0) < 1 and can(shop.get(item, 100)):
+                    return (item, 1)
+
+        # 2) 急救升级：残血建筑用升级券"回满血"（当治疗用，优先级最高）
+        if station is not None and station.health < building_max_health(station) * 0.4:
+            voucher = f"StationUpgradeVoucher{station.level}"
+            if can(shop.get(voucher, 0), soft=True) and voucher not in holding:
+                return (voucher, 1)
+        for weapon in weapons:
+            if weapon.health < building_max_health(weapon) * 0.4 and weapon.level < 3:
+                voucher = f"WeaponUpgradeVoucher{weapon.level}"
+                if can(shop.get(voucher, 0), soft=True) and voucher not in holding:
                     return (voucher, 1)
 
-        # 4) 围墙升级（便宜的大额血量）
-        for voucher, target_level in (("WallUpgradeVoucher1", 2), ("WallUpgradeVoucher2", 3)):
-            price = shop.get(voucher, 0)
-            if not price or gold < price or voucher in holding:
+        # 3) 主升级序列：加特林L2 -> 火箭L2 -> 基地L2 -> 火箭L3 -> 加特林L3
+        #    -> 围墙L2券 -> 电磁L2 -> 基地L3 -> 围墙L3券 -> 电磁L3
+        sequence: list[tuple[str, str]] = []
+        gatlings = [w for w in weapons if w.kind == "gatling"]
+        rockets = [w for w in weapons if w.kind == "rocket"]
+        railguns = [w for w in weapons if w.kind == "railgun"]
+        if any(w.level == 1 for w in gatlings):
+            sequence.append(("WeaponUpgradeVoucher1", "gatling-L2"))
+        if any(w.level == 1 for w in rockets):
+            sequence.append(("WeaponUpgradeVoucher1", "rocket-L2"))
+        if station is not None and station.level == 1:
+            sequence.append(("StationUpgradeVoucher1", "station-L2"))
+        if any(w.level == 2 for w in rockets):
+            sequence.append(("WeaponUpgradeVoucher2", "rocket-L3"))
+        if any(w.level == 2 for w in gatlings):
+            sequence.append(("WeaponUpgradeVoucher2", "gatling-L3"))
+        if any(w.level == 1 for w in turn.walls()):
+            sequence.append(("WallUpgradeVoucher1", "wall-L2"))
+        if any(w.level == 1 for w in railguns):
+            sequence.append(("WeaponUpgradeVoucher1", "railgun-L2"))
+        if station is not None and station.level == 2:
+            sequence.append(("StationUpgradeVoucher2", "station-L3"))
+        if any(w.level == 2 for w in turn.walls()):
+            sequence.append(("WallUpgradeVoucher2", "wall-L3"))
+        if any(w.level == 2 for w in railguns):
+            sequence.append(("WeaponUpgradeVoucher2", "railgun-L3"))
+
+        # 同一张券名可能在序列中出现多次（如火箭/加特林共用 WeaponUpgradeVoucher1），
+        # 目标选择交给 _voucher_target（挑残血目标），这里只判断"存在可升目标"。
+        for voucher, tag in sequence:
+            if voucher in holding:
                 continue
-            if any(wall.level == target_level - 1 for wall in turn.walls()):
+            price = shop.get(voucher, 0)
+            if not can(price):
+                continue
+            if self._voucher_exists(turn, voucher):
                 return (voucher, 1)
         return None
 
-    # ---- 升级券使用（走到目标建筑旁使用）
+    def _voucher_exists(self, turn: Turn, voucher: str) -> bool:
+        if voucher.startswith("Weapon"):
+            wanted = 1 if voucher.endswith("1") else 2
+            return any(w.level == wanted for w in turn.weapons())
+        if voucher.startswith("Station"):
+            station = turn.station()
+            return station is not None
+        if voucher.startswith("Wall"):
+            wanted = 1 if voucher.endswith("1") else 2
+            return any(w.level == wanted for w in turn.walls())
+        return False
+
+    # ---- 升级券使用（走到目标建筑旁使用；目标选血量最低的）
 
     def use_vouchers(self, turn: Turn, roles: list[Unit], decision: Decision,
                      claimed: set[Pos]) -> None:
@@ -336,22 +410,27 @@ class Economy:
                     break  # 每回合每人最多处理一张券
 
     def _voucher_target(self, turn: Turn, role: Unit, item: str) -> Pos | None:
+        """券的使用目标：符合等级的候选中挑血量最低的（升级回满血收益最大）。"""
         if item.startswith("Weapon"):
             wanted_level = 1 if item.endswith("1") else 2
-            for weapon in turn.weapons():
-                if weapon.level == wanted_level:
-                    return weapon.pos
-        elif item.startswith("Station"):
+            candidates = [w for w in turn.weapons() if w.level == wanted_level]
+            if not candidates:
+                return None
+            return min(candidates, key=lambda w: w.health).pos
+        if item.startswith("Station"):
             station = turn.station()
-            if station is not None:
-                return station.pos
-        elif item.startswith("Wall"):
+            return station.pos if station is not None else None
+        if item.startswith("Wall"):
             wanted_level = 1 if item.endswith("1") else 2
-            for wall in turn.walls():
-                if wall.level == wanted_level:
-                    return wall.pos
+            candidates = [w for w in turn.walls() if w.level == wanted_level]
+            if not candidates:
+                return None
+            return min(candidates, key=lambda w: w.health).pos
         return None
 
 
 DAY_SELL_DEADLINE = 60     # 白天第 60 回合后金属工人开始收尾贩卖
 GOLD_TRIP_LINE = 120       # 金币闲置到该值就提前跑一趟商店消费
+RESTOCK_ITEMS = ("WallFixer", "Bomb", "DizzyWeapon", "Medicine")
+HOMEBOUND_ROUND = 60       # 白天该回合起按"能否在封门前到家"决定是否动身
+GATE_CLOSE_ROUND = 69      # 与 brain.GATE_CLOSE_ROUND 保持一致
